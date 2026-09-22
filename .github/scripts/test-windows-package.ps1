@@ -19,8 +19,13 @@ $installDir = Join-Path $env:ProgramFiles 'CuePool'
 $profileDir = Join-Path $env:APPDATA 'CuePool'
 $shortcut = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'CuePool.lnk'
 $uninstallRoot = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+function Get-CuePoolRegistrations {
+    Get-ItemProperty "$uninstallRoot\*" | Where-Object {
+        $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -eq 'CuePool'
+    }
+}
 if ((Test-Path $installDir) -or (Test-Path $profileDir) -or (Test-Path $shortcut) -or
-    @(Get-ItemProperty "$uninstallRoot\*" | Where-Object DisplayName -eq 'CuePool').Count) {
+    @(Get-CuePoolRegistrations).Count) {
     throw 'Refusing to overwrite an existing CuePool installation or user profile.'
 }
 New-Item -ItemType Directory -Force $LogDir, $profileDir | Out-Null
@@ -91,7 +96,7 @@ function New-FailingMsi([string]$source, [string]$destination) {
     }
 }
 function Assert-Registrations([string[]]$expected) {
-    $actual = @(Get-ItemProperty "$uninstallRoot\*" | Where-Object DisplayName -eq 'CuePool' | Select-Object -ExpandProperty PSChildName)
+    $actual = @(Get-CuePoolRegistrations | Select-Object -ExpandProperty PSChildName)
     if ($actual.Count -ne $expected.Count -or @($actual | Where-Object { $_ -notin $expected }).Count) {
         throw "Unexpected CuePool registrations: $($actual -join ', '); expected $($expected -join ', ')"
     }

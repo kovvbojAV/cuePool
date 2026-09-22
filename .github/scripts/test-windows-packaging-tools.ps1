@@ -12,6 +12,30 @@ function global:wix {
     $global:LASTEXITCODE = 0
 }
 try {
+    # Use the rehearsal's actual query with a registry boundary stub. Windows
+    # Uninstall includes unnamed entries, which must also work in StrictMode.
+    & {
+        Set-StrictMode -Version Latest
+        $uninstallRoot = 'registry fixture'
+        function Get-ItemProperty {
+            [pscustomobject]@{ PSChildName = 'unnamed' }
+            [pscustomobject]@{ DisplayName = $null; PSChildName = 'empty' }
+            [pscustomobject]@{ DisplayName = 'Other app'; PSChildName = 'other' }
+            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-one' }
+            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-two' }
+        }
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PSScriptRoot/test-windows-package.ps1", [ref]$tokens, [ref]$errors)
+        Assert ($errors.Count -eq 0) 'Windows rehearsal has PowerShell syntax errors'
+        $query = $ast.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-CuePoolRegistrations'
+        }, $true)
+        . ([scriptblock]::Create($query.Extent.Text))
+        $found = @(Get-CuePoolRegistrations)
+        Assert ($found.Count -eq 2 -and $found[0].PSChildName -eq 'legacy-one' -and $found[1].PSChildName -eq 'legacy-two') 'Registry query lost CuePool products or included unrelated entries'
+    }
     $sdk = Join-Path $work 'FFmpeg & SDK'
     $crt = Join-Path $work 'CRT'
     $asio = Join-Path $work 'ASIO'
