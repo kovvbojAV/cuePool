@@ -25,20 +25,27 @@ try {
     if ($checksumLines.Count -ne 1 -or $checksumLines[0].Groups[1].Value -ne $hash) {
         throw 'Public MSI does not match the release checksum manifest.'
     }
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $database = $installer.OpenDatabase($msi, 0)
     function Read-Property([string]$name) {
-        $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'")
-        $view.Execute()
-        $record = $view.Fetch()
-        if (-not $record) { throw "Missing MSI property: $name" }
-        try { $record.StringData(1) } finally {
-            $view.Close()
-            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
-            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+        $view = $null
+        $record = $null
+        try {
+            $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'")
+            $view.Execute()
+            $record = $view.Fetch()
+            if (-not $record) { throw "Missing MSI property: $name" }
+            $record.StringData(1)
+        } finally {
+            if ($null -ne $record) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null }
+            if ($null -ne $view) {
+                try { $view.Close() } finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null }
+            }
         }
     }
+    $installer = $null
+    $database = $null
     try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.OpenDatabase($msi, 0)
         $productCode = Read-Property 'ProductCode'
         $upgradeCode = Read-Property 'UpgradeCode'
         if ((Read-Property 'ProductVersion') -ne $Version -or
@@ -50,8 +57,8 @@ try {
             throw 'Published MSI identity differs from the WinGet package contract.'
         }
     } finally {
-        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
-        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+        if ($null -ne $database) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null }
+        if ($null -ne $installer) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null }
     }
     $directory = Join-Path $Out "manifests/b/BlueJayLouche/CuePool/$Version"
     if (Test-Path $directory) { throw "Refusing to overwrite existing manifests: $directory" }

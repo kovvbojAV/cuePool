@@ -41,7 +41,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Manifest validation failed' }
           winget settings --enable LocalManifestFiles
           if ($LASTEXITCODE -ne 0) { throw 'Local manifest setup failed' }
-          winget install --manifest $manifest --silent --scope machine --accept-source-agreements --accept-package-agreements --disable-interactivity
+          winget install --manifest $manifest --silent --scope machine --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw 'WinGet installation failed' }
           $exe = Join-Path $env:ProgramFiles 'CuePool/cuepool.exe'
           $identity = & $exe --version
@@ -49,7 +49,7 @@ jobs:
               throw 'Installed CuePool version differs from the manifest'
           }
           # Before repository acceptance, ARP matching supplies the uninstall entry.
-          winget uninstall --name CuePool --exact --silent --accept-source-agreements --disable-interactivity
+          winget uninstall --name CuePool --exact --silent --source winget --disable-interactivity
           if ($LASTEXITCODE -ne 0 -or (Test-Path $exe)) { throw 'WinGet uninstallation failed' }
       - name: Retain manifests and diagnostics
         if: always()
