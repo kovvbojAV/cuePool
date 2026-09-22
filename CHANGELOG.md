@@ -5,6 +5,12 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-09-22
+
+### Packaging fixes
+
+- publish Windows packages under kovvbojAV
+
 ## [0.13.1](https://github.com/kovvbojAV/cuePool/compare/v0.13.0...v0.13.1) - 2026-09-22
 
 ### Application fixes
