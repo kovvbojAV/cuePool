@@ -168,6 +168,10 @@ as a pass. See [GitHub's token event rules](https://docs.github.com/en/actions/h
 The current organisation policy prevents GitHub Actions from creating PRs. A
 maintainer can prepare the same proposal locally and open a normal PR using their
 existing GitHub login. No policy change or additional repository secret is needed.
+While that policy applies, disable only the **Release preparation** workflow in
+Actions to avoid repeated bot-PR failures. Keep **CI** and **Release** enabled:
+publication and receipt recovery do not depend on release preparation. Re-enable
+the preparation workflow if automated PRs become permitted.
 Install the pinned `release-plz 0.3.162`, then start from a clean checkout:
 
 ```sh
