@@ -7,7 +7,7 @@
 <p align="center">Sound, video, and lighting cues for live shows.</p>
 
 <p align="center">
-  <a href="https://bluejaylouche.github.io/cuePool/">User guide</a> ·
+  <a href="https://kovvbojav.github.io/cuePool/">User guide</a> ·
   <a href="#getting-started">Getting started</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -47,7 +47,7 @@ adding a cue, playing it with **Space**, and saving your project.
 
 ## Documentation
 
-- [User guide](https://bluejaylouche.github.io/cuePool/) — cue types, audio,
+- [User guide](https://kovvbojav.github.io/cuePool/) — cue types, audio,
   video, lighting, and show control. Also available [in this repository](guide/src/README.md).
 - [Command-line options](guide/src/getting-started.md#command-line-options) —
   open a project at startup and choose the initial mode.

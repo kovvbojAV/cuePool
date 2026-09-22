@@ -34,6 +34,11 @@ runs:
         }
         "CPAL_ASIO_DIR=$dir" >> $env:GITHUB_ENV
 
+        # asio-sys reuses existing generated bindings/libasio.a even when the
+        # SDK path changes. Cached outputs must not bypass the pinned SDK.
+        cargo clean --package asio-sys --release
+        if ($LASTEXITCODE -ne 0) { throw "Could not clear cached ASIO build outputs" }
+
     - name: Install pthreads for AprilTag
       shell: pwsh
       run: |

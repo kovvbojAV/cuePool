@@ -100,7 +100,7 @@ pub(crate) fn identity_card(
             ui.separator();
             ui.add_space(8.0);
             ui.label("A professional audio/video playback application");
-            ui.hyperlink_to("GitHub", "https://github.com/BlueJayLouche/CuePool");
+            ui.hyperlink_to("GitHub", "https://github.com/kovvbojAV/cuePool");
             ui.label("License: GPL-3.0");
             ui.add_space(12.0);
             close_requested = ui
