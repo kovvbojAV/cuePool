@@ -30,14 +30,14 @@ try {
         $record = $null
         try {
             $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'")
-            $view.Execute()
+            [void]$view.Execute()
             $record = $view.Fetch()
             if (-not $record) { throw "Missing MSI property: $name" }
             $record.StringData(1)
         } finally {
             if ($null -ne $record) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null }
             if ($null -ne $view) {
-                try { $view.Close() } finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null }
+                try { [void]$view.Close() } finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null }
             }
         }
     }

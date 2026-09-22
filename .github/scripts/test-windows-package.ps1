@@ -44,13 +44,13 @@ function Read-MsiColumn([string]$path, [string]$query) {
     $database = $installer.OpenDatabase($path, 0)
     $view = $database.OpenView($query)
     try {
-        $view.Execute()
+        [void]$view.Execute()
         while ($record = $view.Fetch()) {
             $record.StringData(1)
             [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
         }
     } finally {
-        $view.Close()
+        [void]$view.Close()
         [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
         [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
     }
@@ -79,8 +79,8 @@ function New-FailingMsi([string]$source, [string]$destination) {
         $queries += "INSERT INTO ``InstallExecuteSequence`` (``Action``, ``Condition``, ``Sequence``) VALUES ('CuePoolRehearsalFailure', 'NOT Installed', $($remove + 1))"
         foreach ($query in $queries) {
             $view = $database.OpenView($query)
-            try { $view.Execute() } finally {
-                $view.Close()
+            try { [void]$view.Execute() } finally {
+                [void]$view.Close()
                 [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
             }
         }
@@ -88,9 +88,9 @@ function New-FailingMsi([string]$source, [string]$destination) {
         $summary = $database.SummaryInformation(1)
         $summary.GetType().InvokeMember('Property', [Reflection.BindingFlags]::SetProperty, $null, $summary,
             @(9, ('{' + [guid]::NewGuid().ToString().ToUpperInvariant() + '}'))) | Out-Null
-        $summary.Persist()
+        [void]$summary.Persist()
         [Runtime.InteropServices.Marshal]::FinalReleaseComObject($summary) | Out-Null
-        $database.Commit()
+        [void]$database.Commit()
     } finally {
         [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
     }
