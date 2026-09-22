@@ -5,7 +5,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$id = 'BlueJayLouche.CuePool'
+$id = 'kovvbojAV.CuePool'
 $repository = 'https://github.com/kovvbojAV/cuePool'
 $asset = 'cuepool-windows-x86_64.msi'
 $url = "$repository/releases/download/v$Version/$asset"
@@ -50,7 +50,7 @@ try {
         $upgradeCode = Read-Property 'UpgradeCode'
         if ((Read-Property 'ProductVersion') -ne $Version -or
             (Read-Property 'ProductName') -ne 'CuePool' -or
-            (Read-Property 'Manufacturer') -ne 'BlueJayLouche' -or
+            (Read-Property 'Manufacturer') -ne 'kovvbojAV' -or
             (Read-Property 'ALLUSERS') -ne '1' -or
             $upgradeCode -ne '{F5075673-C9EF-5895-C78C-E5839C0E93D8}' -or
             $productCode -notmatch '^\{[0-9A-Fa-f-]{36}\}$') {
@@ -60,7 +60,7 @@ try {
         if ($null -ne $database) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null }
         if ($null -ne $installer) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null }
     }
-    $directory = Join-Path $Out "manifests/b/BlueJayLouche/CuePool/$Version"
+    $directory = Join-Path $Out "manifests/k/kovvbojAV/CuePool/$Version"
     if (Test-Path $directory) { throw "Refusing to overwrite existing manifests: $directory" }
     New-Item -ItemType Directory -Force $directory | Out-Null
     @"
@@ -76,7 +76,7 @@ ManifestVersion: 1.12.0
 PackageIdentifier: $id
 PackageVersion: $Version
 PackageLocale: en-US
-Publisher: BlueJayLouche
+Publisher: kovvbojAV
 PublisherUrl: https://github.com/kovvbojAV
 PublisherSupportUrl: $repository/issues
 PackageName: CuePool
@@ -104,7 +104,7 @@ Installers:
   ProductCode: '$productCode'
   AppsAndFeaturesEntries:
   - DisplayName: CuePool
-    Publisher: BlueJayLouche
+    Publisher: kovvbojAV
     ProductCode: '$productCode'
     UpgradeCode: '$upgradeCode'
 ManifestType: installer

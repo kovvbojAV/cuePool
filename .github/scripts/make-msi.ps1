@@ -63,9 +63,11 @@ $components = (Get-ChildItem $SourceDir -File | Sort-Object Name | ForEach-Objec
     }
 }) -join "`n"
 
+# Preserve the shortcut's legacy registry key below: it determines component
+# identity, independently of the publisher displayed in Apps and Features.
 $wxs = @"
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="$(Xml $Name)" Manufacturer="BlueJayLouche" Version="$Version"
+  <Package Name="$(Xml $Name)" Manufacturer="kovvbojAV" Version="$Version"
            UpgradeCode="$upgrade" Scope="perMachine">
     <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of $(Xml $Name) is already installed." />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/kovvbojAV/cuePool" />

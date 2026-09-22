@@ -93,10 +93,13 @@ CuePool updates.
 ### MSI installation and upgrades
 
 The MSI installs for all users into `C:\Program Files\CuePool`, adds a common
-Start-menu shortcut, and associates `.qproj` files with CuePool. It keeps the
-existing `BlueJayLouche` publisher and UpgradeCode
-`{F5075673-C9EF-5895-C78C-E5839C0E93D8}` so existing CuePool MSIs remain in the
-same upgrade family. Repository relocation does not change installer identity.
+Start-menu shortcut, and associates `.qproj` files with CuePool. Its publisher
+is `kovvbojAV`, matching the canonical repository and WinGet package
+`kovvbojAV.CuePool`. It preserves UpgradeCode
+`{F5075673-C9EF-5895-C78C-E5839C0E93D8}` so existing CuePool MSIs published as
+`BlueJayLouche` remain in the same upgrade family. The internal
+`Software\BlueJayLouche\CuePool` registry key also remains unchanged to preserve
+the shortcut component's identity; it does not set the displayed publisher.
 
 From an elevated Windows terminal:
 

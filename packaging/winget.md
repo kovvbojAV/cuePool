@@ -12,12 +12,12 @@ and a source link alone do not establish that the complete corresponding
 source is available. See [FFmpeg redistribution guidance](https://ffmpeg.org/legal.html)
 and the bundled ASIO license. WinGet validation does not perform this check.
 
-The intended identity preserves the MSI's existing publisher:
+The WinGet identity matches the canonical repository owner and MSI publisher:
 
 | Field | Value/source |
 | --- | --- |
-| PackageIdentifier | `BlueJayLouche.CuePool` |
-| Publisher | `BlueJayLouche` (MSI Manufacturer) |
+| PackageIdentifier | `kovvbojAV.CuePool` |
+| Publisher | `kovvbojAV` (MSI Manufacturer) |
 | PackageName | `CuePool` (MSI ProductName) |
 | PackageVersion | Final MSI ProductVersion |
 | PackageLocale | `en-US` |
@@ -32,7 +32,11 @@ The intended identity preserves the MSI's existing publisher:
 | InstallerUrl | Exact versioned release URL ending in `cuepool-windows-x86_64.msi` |
 | InstallerSha256 | SHA256 of the MSI downloaded from that URL |
 | ProductCode | ProductCode read from that same MSI |
-| AppsAndFeaturesEntries | DisplayName `CuePool`, Publisher `BlueJayLouche`, the same ProductCode, UpgradeCode `{F5075673-C9EF-5895-C78C-E5839C0E93D8}` |
+| AppsAndFeaturesEntries | DisplayName `CuePool`, Publisher `kovvbojAV`, the same ProductCode, UpgradeCode `{F5075673-C9EF-5895-C78C-E5839C0E93D8}` |
+
+The UpgradeCode remains unchanged so newer installers can replace CuePool MSIs
+published as `BlueJayLouche`. That upgrade compatibility does not require the
+old publisher name in WinGet metadata. See [MSI installation and upgrades](README.md#msi-installation-and-upgrades).
 
 The version, public URL, hash and ProductCode remain release outputs; no final
 manifest is committed here with placeholders. `package-validation/result.json`
@@ -40,8 +44,8 @@ records the tested MSI's version, SHA256, ProductCode and UpgradeCode. Compare
 it with the public download before submission.
 
 For the first submission, run **Validate WinGet submission** in GitHub Actions
-with the published version (for example `0.13.0`). This workflow downloads the
-public MSI and checksum manifest, verifies its actual product identity, creates
+with a published version whose MSI Manufacturer is `kovvbojAV`. This workflow
+downloads the public MSI and checksum manifest, verifies its actual product identity, creates
 the three schema-1.12 manifests, and tests validation, installation and removal
 through WinGet on a disposable Windows runner. Use the manifest files from its
 `cuepool-winget-submission` artifact only after the job succeeds; the workflow
@@ -57,20 +61,20 @@ The manual steps below remain available with Microsoft's manifest tool.
    WinGet supplies standard MSI silent switches; no custom installer script or
    Cargo dependency is needed. The packaged runtime is app-local.
 3. Save the version, installer and English locale manifests under
-   `manifests/b/BlueJayLouche/CuePool/<version>/` in a fork of
+   `manifests/k/kovvbojAV/CuePool/<version>/` in a fork of
    `microsoft/winget-pkgs`. Validate with `winget validate --manifest <directory>`.
 4. On a disposable Windows machine, enable local manifests with
    `winget settings --enable LocalManifestFiles`, then run
    `winget install --manifest <directory> --silent --scope machine` and
-   `winget uninstall --id BlueJayLouche.CuePool --exact --silent`. Check the
+   `winget uninstall --id kovvbojAV.CuePool --exact --silent`. Check the
    installed version and the same machine path used by the MSI rehearsal.
 5. Submit the manifests with `wingetcreate submit <directory>` or a PR to
    `microsoft/winget-pkgs`. Resolve automated installer/security validation and
    maintainer feedback, then verify the published source with
-   `winget show --id BlueJayLouche.CuePool --exact --source winget`.
+   `winget show --id kovvbojAV.CuePool --exact --source winget`.
 
 On an accepted exhibit installation, prevent broad upgrade commands from
-changing it with `winget pin add --id BlueJayLouche.CuePool --exact --blocking`.
+changing it with `winget pin add --id kovvbojAV.CuePool --exact --blocking`.
 Remove the pin only for a scheduled, validated upgrade. WinGet does not replace
 show acceptance or project/settings backups.
 

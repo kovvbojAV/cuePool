@@ -60,6 +60,21 @@ function Read-MsiProperty([string]$path, [string]$name) {
     if (-not $value) { throw "Missing MSI property: $name" }
     $value
 }
+function Set-LegacyPublisher([string]$path) {
+    # Only newly generated disposable fixtures are edited, before installation.
+    # Keep their ProductCode, UpgradeCode and component identities unchanged.
+    $database = $installer.OpenDatabase($path, 1)
+    try {
+        $view = $database.OpenView("UPDATE ``Property`` SET ``Value`` = 'BlueJayLouche' WHERE ``Property`` = 'Manufacturer'")
+        try { [void]$view.Execute() } finally {
+            [void]$view.Close()
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+        }
+        [void]$database.Commit()
+    } finally {
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
+    }
+}
 function New-FailingMsi([string]$source, [string]$destination) {
     # Only this disposable copy is edited. The releasable MSI has no failure
     # switch or custom action. Type 19 fails after the nested old uninstalls.
@@ -95,10 +110,16 @@ function New-FailingMsi([string]$source, [string]$destination) {
         [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
     }
 }
-function Assert-Registrations([string[]]$expected) {
-    $actual = @(Get-CuePoolRegistrations | Select-Object -ExpandProperty PSChildName)
+function Assert-Registrations([string[]]$expected, [string]$publisher, [string]$version) {
+    $entries = @(Get-CuePoolRegistrations)
+    $actual = @($entries | Select-Object -ExpandProperty PSChildName)
     if ($actual.Count -ne $expected.Count -or @($actual | Where-Object { $_ -notin $expected }).Count) {
         throw "Unexpected CuePool registrations: $($actual -join ', '); expected $($expected -join ', ')"
+    }
+    foreach ($entry in $entries) {
+        if ($entry.Publisher -ne $publisher -or $entry.DisplayVersion -ne $version) {
+            throw "Registration $($entry.PSChildName) has publisher/version '$($entry.Publisher)'/'$($entry.DisplayVersion)'; expected '$publisher'/'$version'"
+        }
     }
 }
 function Assert-DirectoryHashes([string]$directory, [hashtable]$expected) {
@@ -168,7 +189,10 @@ $upgradeCode = Read-MsiProperty $Msi 'UpgradeCode'
 $results.product_code = $productCode
 $results.upgrade_code = $upgradeCode
 $results.publisher = Read-MsiProperty $Msi 'Manufacturer'
-$expectedIdentity = [ordered]@{ ProductVersion = $Version; ProductName = 'CuePool'; ALLUSERS = '1'; Manufacturer = 'BlueJayLouche' }
+$expectedIdentity = [ordered]@{
+    ProductVersion = $Version; ProductName = 'CuePool'; ALLUSERS = '1'; Manufacturer = 'kovvbojAV'
+    UpgradeCode = '{F5075673-C9EF-5895-C78C-E5839C0E93D8}'
+}
 $actualIdentity = [ordered]@{}
 foreach ($property in $expectedIdentity.Keys) { $actualIdentity[$property] = Read-MsiProperty $Msi $property }
 $actualIdentity | ConvertTo-Json | Set-Content (Join-Path $LogDir 'msi-identity.json')
@@ -178,7 +202,8 @@ foreach ($property in $expectedIdentity.Keys) {
     }
 }
 # Six same-version products reproduce accumulated legacy MSI registrations.
-# All share component GUIDs; each package gets a distinct ProductCode. This is
+# Retain the old publisher while the candidate uses kovvbojAV. All fixtures
+# share component GUIDs; each package gets a distinct ProductCode. This is
 # an installer-mechanics fixture, not an older application's runtime binary.
 $previousDir = Join-Path $work 'previous'
 New-Item -ItemType Directory $previousDir | Out-Null
@@ -187,21 +212,28 @@ Set-Content (Join-Path $previousDir 'obsolete-release-file.txt') 'removed by upg
 $previousMsis = @()
 $previousCodes = @()
 $components = @()
+$shortcutComponent = Read-MsiColumn $Msi "SELECT ``ComponentId`` FROM ``Component`` WHERE ``Component`` = 'StartMenuShortcut'"
+if (-not $shortcutComponent) { throw 'Candidate is missing the existing shortcut component identity' }
 foreach ($number in 1..6) {
     $previousMsi = Join-Path $work "previous-$number.msi"
     & "$PSScriptRoot\make-msi.ps1" -Name CuePool -Version 0.1.0 -SourceDir $previousDir -Exe cuepool.exe -FileExt qproj -Out $previousMsi
+    Set-LegacyPublisher $previousMsi
     $code = Read-MsiProperty $previousMsi 'ProductCode'
     $currentComponents = @(Read-MsiColumn $previousMsi 'SELECT `ComponentId` FROM `Component`' | Sort-Object)
-    if ((Read-MsiProperty $previousMsi 'UpgradeCode') -ne $upgradeCode -or
+    if ((Read-MsiProperty $previousMsi 'Manufacturer') -ne 'BlueJayLouche' -or
+        (Read-MsiProperty $previousMsi 'ProductVersion') -ne '0.1.0' -or
+        (Read-MsiProperty $previousMsi 'UpgradeCode') -ne $upgradeCode -or
+        (Read-MsiColumn $previousMsi "SELECT ``ComponentId`` FROM ``Component`` WHERE ``Component`` = 'StartMenuShortcut'") -ne $shortcutComponent -or
         $code -eq $productCode -or $code -in $previousCodes -or
         ($number -gt 1 -and @(Compare-Object $components $currentComponents).Count)) {
-        throw 'Legacy fixtures must have distinct ProductCodes and identical UpgradeCode/component identity'
+        throw 'Legacy fixtures must retain BlueJayLouche 0.1.0, distinct ProductCodes and existing UpgradeCode/component identity'
     }
     $components = $currentComponents
     $previousMsis += $previousMsi
     $previousCodes += $code
 }
 $results.previous_product_codes = $previousCodes
+$results.previous_publisher = 'BlueJayLouche'
 $failingMsi = Join-Path $work 'candidate-with-test-failure.msi'
 New-FailingMsi $Msi $failingMsi
 try {
@@ -213,7 +245,7 @@ try {
     }
     Test-Runtime $portable 'zip-runtime'
     foreach ($index in 0..5) { Invoke-Msi /i $previousMsis[$index] "install-previous-$($index + 1)" }
-    Assert-Registrations $previousCodes
+    Assert-Registrations $previousCodes 'BlueJayLouche' '0.1.0'
     # Mimic a file-copy promotion performed after the legacy MSI installs.
     Set-Content (Join-Path $installDir 'cuepool.exe') 'manually promoted executable fixture'
     $legacyHashes = @{}
@@ -222,19 +254,15 @@ try {
     Copy-Item $installDir $backupDir -Recurse
     Invoke-Msi /i $failingMsi 'forced-upgrade-failure' 1603
     Assert-RollbackLog (Get-Content (Join-Path $LogDir 'forced-upgrade-failure.log') -Raw) $previousCodes
-    Assert-Registrations $previousCodes
+    Assert-Registrations $previousCodes 'BlueJayLouche' '0.1.0'
     Assert-DirectoryHashes $installDir $legacyHashes
     Assert-DirectoryHashes $backupDir $legacyHashes
     Assert-DataPreserved
     $results.checks += 'transaction-restored-six-products-payload-and-data'
     Invoke-Msi /i $Msi 'upgrade-six-products-to-candidate'
-    Assert-Registrations @($productCode)
+    Assert-Registrations @($productCode) 'kovvbojAV' $Version
     if (Test-Path (Join-Path $installDir 'obsolete-release-file.txt')) {
         throw 'Upgrade left the previous product or obsolete payload installed'
-    }
-    $registered = Get-ItemProperty "$uninstallRoot\$productCode"
-    if ($registered.DisplayVersion -ne $Version -or $registered.Publisher -ne 'BlueJayLouche') {
-        throw 'Apps and Features identity does not match the release'
     }
     if (-not (Test-Path $shortcut)) { throw 'Missing machine-wide Start-menu shortcut' }
     $shell = New-Object -ComObject WScript.Shell
@@ -247,6 +275,7 @@ try {
     Assert-DataPreserved
     Test-Runtime $installDir 'msi-runtime'
     Invoke-Msi /i $previousMsis[0] 'reject-downgrade' 1603
+    Assert-Registrations @($productCode) 'kovvbojAV' $Version
     Assert-Payload $installDir
     Invoke-Msi /x $Msi 'uninstall-candidate'
     if ((Test-Path "$installDir\cuepool.exe") -or (Test-Path "$uninstallRoot\$productCode") -or (Test-Path $shortcut)) {
@@ -255,11 +284,12 @@ try {
     Assert-DataPreserved
     Assert-Registrations @()
     Invoke-Msi /i $previousMsis[0] 'manual-rollback-reinstall-previous'
-    Assert-Registrations @($previousCodes[0])
+    Assert-Registrations @($previousCodes[0]) 'BlueJayLouche' '0.1.0'
     if (-not (Test-Path "$installDir\obsolete-release-file.txt")) { throw 'Previous package was not restored' }
     Assert-DataPreserved
     Invoke-Msi /x $previousMsis[0] 'remove-previous'
     Invoke-Msi /i $Msi 'clean-install-candidate'
+    Assert-Registrations @($productCode) 'kovvbojAV' $Version
     Assert-Payload $installDir
     Test-Runtime $installDir 'clean-msi-runtime'
     Invoke-Msi /x $Msi 'clean-uninstall-candidate'

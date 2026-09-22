@@ -36,7 +36,7 @@ jobs:
         env:
           CUEPOOL_VERSION: ${{ inputs.version }}
         run: |
-          $manifest = "winget-manifests/manifests/b/BlueJayLouche/CuePool/$env:CUEPOOL_VERSION"
+          $manifest = "winget-manifests/manifests/k/kovvbojAV/CuePool/$env:CUEPOOL_VERSION"
           winget validate --manifest $manifest
           if ($LASTEXITCODE -ne 0) { throw 'Manifest validation failed' }
           winget settings --enable LocalManifestFiles

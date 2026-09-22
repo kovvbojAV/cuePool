@@ -21,8 +21,8 @@ try {
             [pscustomobject]@{ PSChildName = 'unnamed' }
             [pscustomobject]@{ DisplayName = $null; PSChildName = 'empty' }
             [pscustomobject]@{ DisplayName = 'Other app'; PSChildName = 'other' }
-            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-one' }
-            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-two' }
+            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-one'; Publisher = 'BlueJayLouche'; DisplayVersion = '0.1.0' }
+            [pscustomobject]@{ DisplayName = 'CuePool'; PSChildName = 'legacy-two'; Publisher = 'BlueJayLouche'; DisplayVersion = '0.1.0' }
         }
         $tokens = $null
         $errors = $null
@@ -35,6 +35,17 @@ try {
         . ([scriptblock]::Create($query.Extent.Text))
         $found = @(Get-CuePoolRegistrations)
         Assert ($found.Count -eq 2 -and $found[0].PSChildName -eq 'legacy-one' -and $found[1].PSChildName -eq 'legacy-two') 'Registry query lost CuePool products or included unrelated entries'
+        $identityCheck = $ast.Find({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-Registrations'
+        }, $true)
+        . ([scriptblock]::Create($identityCheck.Extent.Text))
+        Assert-Registrations @('legacy-one', 'legacy-two') 'BlueJayLouche' '0.1.0'
+        $failed = $false
+        try { Assert-Registrations @('legacy-one', 'legacy-two') 'kovvbojAV' '0.1.0' } catch { $failed = $true }
+        Assert $failed 'Legacy registrations were accepted as the new publisher'
+        $failed = $false
+        try { Assert-Registrations @('legacy-one', 'legacy-two') 'BlueJayLouche' '0.13.1' } catch { $failed = $true }
+        Assert $failed 'Legacy registrations were accepted as the new version'
     }
     $sdk = Join-Path $work 'FFmpeg & SDK'
     $crt = Join-Path $work 'CRT'
@@ -82,10 +93,13 @@ try {
     Copy-Item "$payload/cuepool.exe" $msiPayload
     & "$root/.github/scripts/make-msi.ps1" -Name CuePool -Version 0.12.1 -SourceDir $msiPayload -Exe cuepool.exe -FileExt qproj -Out "$work/check.msi"
     $package = $global:cuepoolTestWxs.Wix.Package
+    Assert ($package.Manufacturer -eq 'kovvbojAV') 'MSI publisher differs from the canonical owner'
     Assert ($package.UpgradeCode -eq 'f5075673-c9ef-5895-c78c-e5839c0e93d8') 'Existing UpgradeCode changed'
     Assert ($package.MajorUpgrade.Schedule -eq 'afterInstallInitialize') 'Upgrade removal is outside the rollback transaction'
     $file = $global:cuepoolTestWxs.SelectSingleNode('//*[local-name()="File" and @Id="AppExe"]')
     Assert ($file.Source -eq (Join-Path $msiPayload 'cuepool.exe')) 'WiX file path was not escaped faithfully'
+    $shortcutKey = $global:cuepoolTestWxs.SelectSingleNode('//*[local-name()="Component" and @Id="StartMenuShortcut"]/*[local-name()="RegistryValue"]')
+    Assert ($shortcutKey.Root -eq 'HKLM' -and $shortcutKey.Key -eq 'Software\BlueJayLouche\CuePool' -and $shortcutKey.KeyPath -eq 'yes') 'Publisher rename changed the legacy shortcut component key path'
     Write-Output 'Packaging tool checks passed (Windows installer execution is a separate CI gate).'
 } finally {
     $env:FFMPEG_DIR = $oldFfmpeg
