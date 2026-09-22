@@ -95,6 +95,8 @@ jobs:
       - uses: ./.github/actions/setup-windows-deps
       # Match the release build so Windows failures are caught before tagging.
       - run: cargo build --release --locked -p cuepool --features asio
+      - name: Verify desktop subsystem and command-line output
+        run: .github/scripts/test-windows-cli.ps1 -Exe target/release/cuepool.exe -UseBuildEnvironment
       - name: Verify media decoding with the packaged Windows SDK
         run: cargo test --release --locked -p cuepool-harness --test headless_show --features cuepool/asio
       - name: Test AprilTag calibration

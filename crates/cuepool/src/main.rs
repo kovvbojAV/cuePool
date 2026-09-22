@@ -1,3 +1,6 @@
+// Release builds launched from Explorer must not open a terminal behind the UI.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! CuePool binary — custom winit event loop with native control, status, and output windows.
 //!
 //! - Control window: egui UI (replaces eframe)
@@ -73,6 +76,8 @@ mod settings;
 use settings::{AppProfile, load_settings, save_settings_from_state};
 mod video_pipeline;
 mod video_timing;
+#[cfg(windows)]
+mod windows_console;
 #[cfg(windows)]
 use video_pipeline::win_timer;
 use video_pipeline::{
@@ -5322,6 +5327,8 @@ fn main() -> anyhow::Result<()> {
         .skip(1)
         .eq([OsString::from("--version")])
     {
+        #[cfg(windows)]
+        windows_console::attach_parent_for_cli();
         println!("CuePool {}", cuepool_core::build_identity::BUILD.display);
         println!(
             "ASIO: {}",

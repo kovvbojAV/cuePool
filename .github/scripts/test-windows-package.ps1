@@ -141,6 +141,7 @@ function Assert-Payload([string]$directory) {
     }
 }
 function Test-Runtime([string]$directory, [string]$label) {
+    & "$PSScriptRoot/test-windows-cli.ps1" -Exe (Join-Path $directory 'cuepool.exe')
     # This verifies the executable's actual Windows loader and linked DLLs,
     # independent of the build SDK's PATH. Rig playback is a separate check.
     $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $directory 'cuepool.exe'))

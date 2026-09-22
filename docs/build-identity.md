@@ -7,6 +7,14 @@ reachable `vX.Y.Z` tag and distance from it. Modified builds include a fingerpri
 of their diff and untracked files; this identifies local edits, but does not save
 a copy of them. Keep the checkout when diagnosing such a build.
 
+`cuepool --version` prints the same identity and ASIO build support without
+initializing the GUI, audio, logs or user profile. Windows release builds use
+the desktop subsystem so Start-menu, Explorer and project-file launches do not
+open a terminal. Version output preserves inherited pipes/files, and uses an
+existing parent console when needed; it never creates a console. Interactive
+`cmd.exe` does not wait for desktop applications, so use `start /wait` or
+PowerShell's `Start-Process -Wait -PassThru` when the exit status is required.
+
 Cargo checks Git every time it builds. This intentionally adds a small build-script
 cost: watching HEAD or the Git index alone misses new files, tag changes and some
 worktree operations. The generated data contains no timestamp and is only rewritten

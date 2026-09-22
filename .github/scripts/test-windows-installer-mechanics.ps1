@@ -33,7 +33,8 @@ class Fixture {
     }
 }
 '@ | Set-Content $source
-    & $compiler /nologo /target:exe /platform:x64 "/out:$(Join-Path $payload 'cuepool.exe')" $source
+    # Match the desktop subsystem required by the shared packaged-runtime checks.
+    & $compiler /nologo /target:winexe /platform:x64 "/out:$(Join-Path $payload 'cuepool.exe')" $source
     if ($LASTEXITCODE -ne 0) { throw 'Could not compile the synthetic installer fixture' }
     # Deliberately inert files fill the shared rehearsal's runtime payload slots.
     # The synthetic executable never loads these files.
