@@ -8,6 +8,7 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 ### Application
 
 - Identify local builds automatically and inspect their changes offline from Help → Changes.
+- Update the audio sample ring buffer to the version patched for RUSTSEC-2026-0293.
 
 ## [0.12.3]
 

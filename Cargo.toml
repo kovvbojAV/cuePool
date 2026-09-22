@@ -55,7 +55,7 @@ midir = "0.11"
 
 # Threading / Sync
 crossbeam = "0.8"
-ringbuf = "0.4"
+ringbuf = "0.5.2"
 
 # Utils
 bitflags = "2.9"
