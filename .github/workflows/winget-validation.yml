@@ -44,7 +44,8 @@ jobs:
           winget install --manifest $manifest --silent --scope machine --disable-interactivity
           if ($LASTEXITCODE -ne 0) { throw 'WinGet installation failed' }
           $exe = Join-Path $env:ProgramFiles 'CuePool/cuepool.exe'
-          $identity = & $exe --version
+          # Consume the native pipeline so PowerShell waits for the GUI executable.
+          $identity = & $exe --version | Out-String
           if ($LASTEXITCODE -ne 0 -or ($identity -join "`n") -notmatch ('(?m)^CuePool ' + [regex]::Escape($env:CUEPOOL_VERSION) + '(\s|$)')) {
               throw 'Installed CuePool version differs from the manifest'
           }
