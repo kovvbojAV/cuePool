@@ -118,14 +118,18 @@ packaging checks. The Windows release job also runs
 - ZIP and installed executable startup with the SDK removed from `PATH`,
   expected version and ASIO support, and required app-local runtime files.
 - MSI product/publisher/version, machine install path, shortcut, and association.
-- Upgrade from a synthetic `0.0.0` package, removal of obsolete files, rejection
-  of a downgrade, clean installation/uninstallation, and deliberate rollback by
-  uninstalling the candidate and reinstalling the previous package.
+- Upgrade from six simultaneous synthetic `0.1.0` packages sharing component
+  identity. A modified test-only MSI fails after removing them; the test requires
+  all six registrations, the manually overwritten payload, and operator data to
+  return. The unmodified candidate must then leave exactly one registration.
+- Removal of obsolete files, rejection of a downgrade, clean installation and
+  uninstallation, and manual rollback by uninstalling the candidate and
+  reinstalling one previous package.
 - Byte-for-byte payload agreement and preservation of settings/project sentinels.
 
 Logs and `result.json` are uploaded separately as `windows-package-validation`.
-The synthetic prior package proves installer mechanics, not compatibility with
-an older application's project format. `--version` exercises the real Windows
+The synthetic prior packages exercise accumulated MSI registrations and installer
+transactions, not compatibility with an older application's project format. `--version` exercises the real Windows
 loader without requiring a GPU or audio device; it does not prove ASIO routing,
 video presentation, OSC or show playback. Those need an attended rig check.
 
