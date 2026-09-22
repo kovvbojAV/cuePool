@@ -15,8 +15,11 @@ import tempfile
 import tomllib
 import zipfile
 
+import windows_sources
+
 REPOSITORY = "kovvbojAV/cuePool"
-ARTIFACTS = ("cuepool-macos-arm64.dmg", "cuepool-windows-x86_64.zip", "cuepool-windows-x86_64.msi")
+ARTIFACTS = ("cuepool-macos-arm64.dmg", "cuepool-windows-x86_64.zip", "cuepool-windows-x86_64.msi",
+             "cuepool-windows-sources.zip")
 MACOS_NOTE = ("**macOS:** the app is ad-hoc signed, not notarized. On first launch, "
               "right-click → Open, or approve it in System Settings → Privacy & Security.")
 RELEASE_COMMIT = re.compile(r"^(feat|fix)(\([^)]*\))?!?:|^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:", re.M)
@@ -176,7 +179,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def validate_artifacts(directory, build_result, verification_result):
+def validate_artifacts(directory, build_result, verification_result, sha=None):
     if build_result != "success" or verification_result != "success":
         raise ValueError("Publication requires successful verification and BOTH platform builds")
     paths = {name: list(directory.rglob(name)) for name in ARTIFACTS}
@@ -196,6 +199,7 @@ def validate_artifacts(directory, build_result, verification_result):
         stream.seek(-512, 2)
         if stream.read(4) != b"koly":
             raise ValueError("Invalid DMG trailer")
+    windows_sources.validate_archive(paths[ARTIFACTS[3]], sha)
     return paths
 
 
@@ -296,7 +300,7 @@ def publish(tag, sha, directory, build_result, verification_result):
     if existing and not existing["draft"]:
         repair_receipt(tag, sha)
         return
-    paths = validate_artifacts(directory, build_result, verification_result)
+    paths = validate_artifacts(directory, build_result, verification_result, sha)
     ensure_tag(tag, sha)
     sums = directory / "SHA256SUMS"
     sums.write_text("".join(f"{digest(path)}  {name}\n" for name, path in sorted(paths.items())))
@@ -305,7 +309,9 @@ def publish(tag, sha, directory, build_result, verification_result):
     if release and not release["draft"]:
         repair_receipt(tag, sha)
         return
-    body = release_notes(tag) + "\n\n" + MACOS_NOTE + f"\n\n<!-- cuepool-source: {sha} -->\n"
+    body = (release_notes(tag) + "\n\n" + MACOS_NOTE
+            + f"\n\n**Windows source:** [source snapshots and dependency/build index](https://github.com/{REPOSITORY}/releases/download/{tag}/cuepool-windows-sources.zip)."
+            + f"\n\n<!-- cuepool-source: {sha} -->\n")
     if release:
         claimed = re.findall(r"<!-- cuepool-source: (.*?) -->", release.get("body") or "")
         if claimed and claimed != [sha]:
@@ -342,7 +348,7 @@ def main():
     if args.command == "validate":
         print(validate_workspace())
     elif args.command == "validate-artifacts":
-        print("Validated packages:", ", ".join(validate_artifacts(args.artifacts, args.build_result, args.verification_result)))
+        print("Validated packages:", ", ".join(validate_artifacts(args.artifacts, args.build_result, args.verification_result, args.sha)))
     elif args.command == "candidate":
         resolve_candidate()
     elif args.command == "can-prepare":

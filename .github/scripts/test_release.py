@@ -7,6 +7,7 @@ from unittest.mock import patch
 import zipfile
 
 import release
+import windows_sources
 
 
 class ReleaseTests(unittest.TestCase):
@@ -14,11 +15,17 @@ class ReleaseTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        self.release_body = ("Notes\n\n" + release.MACOS_NOTE
+            + "\n\n**Windows source:** [source snapshots and dependency/build index](https://github.com/kovvbojAV/cuePool/releases/download/v0.12.3/cuepool-windows-sources.zip)."
+            + "\n\n<!-- cuepool-source: " + "a" * 40 + " -->\n")
         (self.root / release.ARTIFACTS[0]).write_bytes(b"payload" + b"koly" + bytes(508))
         (self.root / release.ARTIFACTS[2]).write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + b"msi")
         with zipfile.ZipFile(self.root / release.ARTIFACTS[1], "w") as z:
             z.writestr("cuepool.exe", b"exe")
             z.writestr("avcodec.dll", b"dll")
+        sources = {name: b"source fixture" for name in windows_sources.SOURCE_FILES}
+        sources["SOURCE.json"] = b'{"cuepool_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+        windows_sources.write_archive(self.root / release.ARTIFACTS[3], sources)
 
     def test_failed_or_skipped_packaging_never_mutates_github(self):
         for status in ("failure", "cancelled", "skipped", ""):
@@ -42,6 +49,13 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             release.validate_artifacts(self.root, "success", "success")
 
+    def test_missing_source_access_blocks_publication(self):
+        (self.root / release.ARTIFACTS[3]).unlink()
+        with patch.object(release, "find_release", return_value=None), patch.object(release, "api") as api:
+            with self.assertRaisesRegex(ValueError, "Missing"):
+                release.publish("v0.12.3", "a" * 40, self.root, "success", "success")
+            api.assert_not_called()
+
     def test_tag_is_immutable_and_retry_is_noop(self):
         with patch.object(release, "api", return_value={"object": {"type": "commit", "sha": "a" * 40}}) as api:
             release.ensure_tag("v0.12.3", "a" * 40)
@@ -60,7 +74,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_upload_and_readback_precede_publication_and_receipt(self):
         events = []
-        draft = {"tag_name": "v0.12.3", "draft": True, "body": "Notes\n\n" + release.MACOS_NOTE + "\n\n<!-- cuepool-source: " + "a" * 40 + " -->\n"}
+        draft = {"tag_name": "v0.12.3", "draft": True, "body": self.release_body}
         public = {**draft, "draft": False, "published_at": "2026-09-08T00:00:00Z"}
         with patch.object(release, "find_release", return_value=draft), \
              patch.object(release, "ensure_tag"), patch.object(release, "release_notes", return_value="Notes"), \
@@ -73,7 +87,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(events, ["edit", "upload", "readback", "edit", "receipt"])
 
     def test_failed_readback_keeps_draft_private(self):
-        draft = {"tag_name": "v0.12.3", "draft": True, "body": "Notes\n\n" + release.MACOS_NOTE + "\n\n<!-- cuepool-source: " + "a" * 40 + " -->\n"}
+        draft = {"tag_name": "v0.12.3", "draft": True, "body": self.release_body}
         with patch.object(release, "find_release", return_value=draft), \
              patch.object(release, "ensure_tag"), patch.object(release, "release_notes", return_value="Notes"), \
              patch.object(release, "run") as run, \
@@ -147,7 +161,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_reused_draft_gets_canonical_notes_and_attestation(self):
         draft = {"tag_name": "v0.12.3", "draft": True, "body": "Old manually written notes"}
-        body = "Notes\n\n" + release.MACOS_NOTE + "\n\n<!-- cuepool-source: " + "a" * 40 + " -->\n"
+        body = self.release_body
         normalized = {**draft, "body": body}
         commands = []
         def command(*args):

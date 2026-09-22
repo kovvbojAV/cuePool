@@ -53,13 +53,19 @@ The workflow and local packaging use the same `package-windows.ps1` payload:
 `cuepool.exe`, the DLLs from the pinned FFmpeg 8.0 SDK, and the x64 Visual C++
 runtime from Visual Studio's redistributable directory. Packaging fails if
 required runtimes are missing. It preserves CuePool's license files and the
-matching FFmpeg `LICENSE` and `README.txt`, including the source commit and build
-configuration, plus the ASIO SDK license and source URL from the build's
-`CPAL_ASIO_DIR`. The Gyan FFmpeg distribution is GPL v3. The ASIO SDK offers GPL v3 or
+matching FFmpeg `LICENSE.txt`, exact source/build access index and dependency
+hashes, plus the ASIO SDK license from the build's `CPAL_ASIO_DIR`. The pinned
+BtbN FFmpeg distribution is GPL v3. Packaging rejects DLLs that differ from
+`windows-dependencies.json`, keeping the notices tied to the actual runtime.
+The ASIO SDK offers GPL v3 or
 the proprietary Steinberg agreement described in its notice. These dependency
 terms are separate from CuePool's source licenses; packaging does not change
 the licenses of CuePool's source files. Device-specific ASIO drivers are not
-included.
+included. The source archive `cuepool-windows-sources.zip` is a required release
+asset, verified and checksummed alongside the binary packages. It contains
+CuePool, FFmpeg and ASIO source snapshots, the exact FFmpeg build recipes and
+patches, Rust source indexes, and the runner's pthreads port. See
+[Windows source access](windows-sources.md) for the upstream source locations.
 
 After building the release binary with `--features asio`, run:
 

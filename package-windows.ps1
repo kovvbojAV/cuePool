@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot   # repo root
 $exe  = Join-Path $root 'target\release\cuepool.exe'
 $ffmpeg = $env:FFMPEG_DIR
+$deps = Get-Content (Join-Path $root 'packaging/windows-dependencies.json') -Raw | ConvertFrom-Json
 $dist = Join-Path $root 'dist'
 $out = Join-Path $dist 'cuepool'
 $zip = [IO.Path]::GetFullPath($ZipPath)
@@ -25,7 +26,15 @@ if (-not (Test-Path $asioLicense -PathType Leaf)) { throw "Missing ASIO SDK lice
 if (-not $ffmpeg) { throw "Set FFMPEG_DIR to the FFmpeg 8.0 shared SDK used for the build (see .github/workflows/release.yml)." }
 $ffmpegBin = Join-Path $ffmpeg 'bin'
 $dlls = @(Get-ChildItem $ffmpegBin -Filter '*.dll' -File -ErrorAction Stop)
-if ($dlls.Count -eq 0) { throw "No FFmpeg DLLs found in: $ffmpegBin" }
+if ($dlls.Count -ne @($deps.ffmpeg.dll_sha256.PSObject.Properties).Count) {
+    throw 'FFmpeg DLL set differs from the pinned Windows SDK'
+}
+foreach ($dll in $dlls) {
+    $expected = $deps.ffmpeg.dll_sha256.($dll.Name)
+    if (-not $expected -or (Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLower() -ne $expected) {
+        throw "FFmpeg DLL differs from the pinned Windows SDK: $($dll.Name)"
+    }
+}
 
 # Use the redistributable directory shipped with the build tools, never an
 # arbitrary System32 runtime that can differ from the compiler used to build.
@@ -46,7 +55,7 @@ foreach ($name in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') {
         throw "Missing redistributable runtime: $name (pass -VCRuntimeDir pointing to the x64 Microsoft.VC*.CRT directory)"
     }
 }
-$ffmpegLicense = Join-Path $ffmpeg 'LICENSE'
+$ffmpegLicense = Join-Path $ffmpeg 'LICENSE.txt'
 if (-not (Test-Path $ffmpegLicense -PathType Leaf)) { throw "Missing FFmpeg distribution license: $ffmpegLicense" }
 New-Item -ItemType Directory -Force $staging, (Split-Path $zip -Parent) | Out-Null
 
@@ -58,7 +67,8 @@ try {
     Copy-Item (Join-Path $root 'LICENSE-MIT'), (Join-Path $root 'LICENSE-APACHE') $staging
     Copy-Item $ffmpegLicense (Join-Path $staging 'FFmpeg-LICENSE.txt')
     Copy-Item $asioLicense (Join-Path $staging 'Steinberg-ASIO-LICENSE.txt')
-    Copy-Item (Join-Path $ffmpeg 'README.txt') (Join-Path $staging 'FFmpeg-README.txt')
+    Copy-Item (Join-Path $root 'packaging/windows-sources.md') (Join-Path $staging 'THIRD-PARTY-SOURCES.md')
+    Copy-Item (Join-Path $root 'packaging/windows-dependencies.json') $staging
 
     @"
 cuepool (Windows)
@@ -68,8 +78,10 @@ Source and releases: https://github.com/kovvbojAV/cuePool
 Settings: %APPDATA%\CuePool (shared with the installed version).
 Keep projects and media outside this application directory.
 
-FFmpeg 8.0 shared runtime: https://github.com/GyanD/codexffmpeg/releases/tag/8.0
-See FFmpeg-README.txt for the matching source commit and build configuration.
+FFmpeg $($deps.ffmpeg.version) shared runtime (BtbN GPL build).
+See THIRD-PARTY-SOURCES.md and windows-dependencies.json for exact source, build
+scripts, dependency recipes, patches and archive hashes.
+The matching release also provides cuepool-windows-sources.zip.
 See FFmpeg-LICENSE.txt for its separate terms.
 Microsoft Visual C++ runtime is deployed app-local from the build tools' Redist directory.
 Its updates are delivered with CuePool package updates.

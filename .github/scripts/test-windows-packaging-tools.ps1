@@ -16,12 +16,15 @@ try {
     $crt = Join-Path $work 'CRT'
     $asio = Join-Path $work 'ASIO'
     $binaryDir = Join-Path $work 'target/release'
-    New-Item -ItemType Directory -Force $binaryDir, "$sdk/bin", $crt, "$asio/common" | Out-Null
+    New-Item -ItemType Directory -Force $binaryDir, "$sdk/bin", $crt, "$asio/common", "$work/packaging" | Out-Null
     Copy-Item "$root/package-windows.ps1", "$root/LICENSE-MIT", "$root/LICENSE-APACHE" $work
     Set-Content "$binaryDir/cuepool.exe" 'executable fixture'
     Set-Content "$sdk/bin/avcodec-62.dll" 'DLL fixture'
-    Set-Content "$sdk/LICENSE" 'FFmpeg license fixture'
-    Set-Content "$sdk/README.txt" 'upstream notice fixture'
+    Set-Content "$sdk/LICENSE.txt" 'FFmpeg license fixture'
+    Copy-Item "$root/packaging/windows-sources.md" "$work/packaging"
+    $deps = Get-Content "$root/packaging/windows-dependencies.json" -Raw | ConvertFrom-Json
+    $deps.ffmpeg.dll_sha256 = @{ 'avcodec-62.dll' = (Get-FileHash "$sdk/bin/avcodec-62.dll" -Algorithm SHA256).Hash.ToLower() }
+    $deps | ConvertTo-Json -Depth 8 | Set-Content "$work/packaging/windows-dependencies.json"
     foreach ($name in 'vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll') { Set-Content "$crt/$name" 'runtime fixture' }
     Set-Content "$asio/common/LICENSE.txt" 'ASIO license fixture'
     $env:CPAL_ASIO_DIR = $asio
@@ -31,12 +34,19 @@ try {
     Assert (Test-Path $zip) 'Custom ZIP path was not created'
     $payload = Join-Path $work 'dist/cuepool'
     Assert (Test-Path "$payload/FFmpeg-LICENSE.txt") 'FFmpeg license missing'
-    Assert (Test-Path "$payload/FFmpeg-README.txt") 'FFmpeg notices missing'
+    Assert (Test-Path "$payload/THIRD-PARTY-SOURCES.md") 'Source access index missing'
+    Assert (Test-Path "$payload/windows-dependencies.json") 'Pinned dependency metadata missing'
     Assert (Test-Path "$payload/LICENSE-MIT") 'CuePool license missing'
     Set-Content "$payload/obsolete.dll" 'stale payload'
     & "$work/package-windows.ps1" -VCRuntimeDir $crt -ZipPath $zip
     Assert (-not (Test-Path "$payload/obsolete.dll")) 'Repackaging retained a stale DLL'
     $goodHash = (Get-FileHash $zip).Hash
+    Set-Content "$sdk/bin/avcodec-62.dll" 'wrong SDK'
+    $failed = $false
+    try { & "$work/package-windows.ps1" -VCRuntimeDir $crt -ZipPath $zip } catch { $failed = $true }
+    Assert $failed 'A different FFmpeg SDK was packaged under the pinned source notice'
+    Assert ((Get-FileHash $zip).Hash -eq $goodHash) 'Wrong SDK replaced the last good ZIP'
+    Set-Content "$sdk/bin/avcodec-62.dll" 'DLL fixture'
     Remove-Item "$crt/msvcp140.dll"
     $failed = $false
     try { & "$work/package-windows.ps1" -VCRuntimeDir $crt -ZipPath $zip } catch { $failed = $true }

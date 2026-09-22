@@ -171,6 +171,10 @@ jobs:
             -Icon "packaging\icon.ico" `
             -Out "out\cuepool-windows-x86_64.msi" -FileExt "qproj"
 
+      - name: Package Windows source access
+        if: runner.os == 'Windows'
+        run: python .github/scripts/windows_sources.py
+
       - name: Validate Windows installation and rollback
         if: runner.os == 'Windows'
         shell: pwsh
@@ -211,10 +215,11 @@ jobs:
       # This read-only gate also runs for artifacts-only rehearsals and failed
       # builds: a missing platform cannot pass even when publication is disabled.
       - env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
           BUILD_RESULT: ${{ needs.build.result }}
           VERIFY_RESULT: ${{ needs.verify.result }}
         run: >-
-          python3 .github/scripts/release.py validate-artifacts --artifacts artifacts
+          python3 .github/scripts/release.py validate-artifacts --artifacts artifacts --sha "$SOURCE_SHA"
           --build-result "$BUILD_RESULT" --verification-result "$VERIFY_RESULT"
 
   release:

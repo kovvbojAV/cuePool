@@ -227,3 +227,25 @@ A passing Linux suite does not prove Windows or macOS packaging. If the Windows
 AprilTag build still lacks pthread.h, its build job must fail and publication must
 remain blocked. Resolve that platform prerequisite through its own reviewed change;
 do not remove Windows from the release gate.
+
+## Windows dependency sources
+
+Windows builds use the BtbN FFmpeg 8.0-branch shared SDK pinned in
+`packaging/windows-dependencies.json`. Keep headers and DLLs together: CuePool's
+D3D12VA layout guard relies on this ABI. The dependency setup clears cached
+FFmpeg bindings and the video crate's C++ layout probe when restoring Cargo
+builds. Packaging checks all seven DLL hashes against the pin.
+
+`cuepool-windows-sources.zip` is required for publication alongside the MSI,
+portable ZIP and macOS DMG. The workflow creates it from the exact CuePool
+checkout, verified upstream FFmpeg/ASIO archives, the matching BtbN build-script
+snapshot, Cargo source indexes, and the actual vcpkg pthreads port. The release
+checks its member hashes and CuePool commit, then includes it in `SHA256SUMS`
+and the same remote readback check as the binaries. An artifacts-only rehearsal
+produces it too. See [source access](../packaging/windows-sources.md).
+
+When changing the FFmpeg pin, update the binary, seven DLL hashes, corresponding
+FFmpeg source and BtbN build-script snapshots together. Verify the SDK's D3D12VA
+layout, Windows loader and media playback before promotion. Preserve the source
+asset as long as its binary release is offered; upstream BtbN monthly assets
+have a two-year retention policy.
