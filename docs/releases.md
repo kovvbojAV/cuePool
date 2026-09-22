@@ -97,7 +97,12 @@ A read-only prerequisite gate runs even on artifacts-only rehearsals and failed
 builds. The final publication job requires that gate to pass, including successful
 verification and both platform jobs. It also requires exactly one nonempty DMG, portable ZIP and MSI, validates
 their basic container structure, and checks the ZIP contains the executable and
-runtime DLLs. macOS packaging verifies the DMG and application signature.
+runtime DLLs. The Windows job additionally runs the portable executable with a
+clean runtime path and exercises MSI installation, upgrade, uninstall and rollback
+on its disposable hosted runner. Profile/project preservation and installed
+payload hashes are checked; logs are retained as `windows-package-validation`.
+Windows builds explicitly enable ASIO; production packages omit the test harness.
+macOS packaging verifies the DMG and application signature.
 
 The publication script creates or reuses a **draft**, writes the exact changelog
 notes and source attestation (rejecting conflicting source claims), uploads the packages and
@@ -142,7 +147,8 @@ their existing permissions.
 
 For automated release PRs, the repository owner must enable **Settings → Actions
 → General → Workflow permissions → Allow GitHub Actions to create and approve
-pull requests** if the organisation policy permits it. The workflow declares its required write permissions, so
+pull requests** if the organisation policy permits it. The workflow declares its
+required write permissions, so
 there is no need to change the default token permission for all workflows.
 After setup, run **Actions → Release preparation → Run workflow** on `main` to
 create or refresh the proposal. If GitHub refuses PR creation and the organisation

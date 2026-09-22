@@ -163,15 +163,30 @@ jobs:
         shell: pwsh
         run: |
           $dist = "dist\cuepool"
-          New-Item -ItemType Directory -Force $dist, out | Out-Null
-          Copy-Item "target\release\cuepool.exe" $dist
-          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dist
-          Compress-Archive -Path "$dist\*" -DestinationPath "out\cuepool-windows-x86_64.zip"
+          New-Item -ItemType Directory -Force out | Out-Null
+          ./package-windows.ps1 -ZipPath "out\cuepool-windows-x86_64.zip"
           # Explorer file association: .qproj -> CuePool.
           .github\scripts\make-msi.ps1 -Name $env:DISPLAY_NAME -Version $env:VERSION `
             -SourceDir $dist -Exe "cuepool.exe" `
             -Icon "packaging\icon.ico" `
             -Out "out\cuepool-windows-x86_64.msi" -FileExt "qproj"
+
+      - name: Validate Windows installation and rollback
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          .github/scripts/test-windows-package.ps1
+          -Msi out/cuepool-windows-x86_64.msi
+          -Zip out/cuepool-windows-x86_64.zip
+          -Version $env:VERSION -SourceDir dist/cuepool
+
+      - name: Upload Windows installation evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-package-validation
+          path: package-validation/
+          if-no-files-found: ignore
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
