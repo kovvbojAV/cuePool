@@ -79,6 +79,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test Windows packaging tools
+        shell: pwsh
+        run: .github/scripts/test-windows-packaging-tools.ps1
       - uses: ./.github/actions/setup-windows-deps
       # Match the release build so Windows failures are caught before tagging.
       - run: cargo build --release --locked -p cuepool --features asio
