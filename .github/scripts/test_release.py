@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
+import macos_sources
 import release
 import windows_sources
 
@@ -17,6 +18,7 @@ class ReleaseTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.release_body = ("Notes\n\n" + release.MACOS_NOTE
             + "\n\n**Windows source:** [source snapshots and dependency/build index](https://github.com/kovvbojAV/cuePool/releases/download/v0.12.3/cuepool-windows-sources.zip)."
+            + "\n\n**macOS source:** [matching Homebrew recipes, notices and source index](https://github.com/kovvbojAV/cuePool/releases/download/v0.12.3/cuepool-macos-sources.zip)."
             + "\n\n<!-- cuepool-source: " + "a" * 40 + " -->\n")
         (self.root / release.ARTIFACTS[0]).write_bytes(b"payload" + b"koly" + bytes(508))
         (self.root / release.ARTIFACTS[2]).write_bytes(bytes.fromhex("d0cf11e0a1b11ae1") + b"msi")
@@ -26,6 +28,23 @@ class ReleaseTests(unittest.TestCase):
         sources = {name: b"source fixture" for name in windows_sources.SOURCE_FILES}
         sources["SOURCE.json"] = b'{"cuepool_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
         windows_sources.write_archive(self.root / release.ARTIFACTS[3], sources)
+        mac_sources = {name: b"source fixture" for name in macos_sources.SOURCE_FILES}
+        source = {"url": "https://example/ffmpeg.tar.xz",
+                  "sha256": macos_sources.digest(mac_sources["ffmpeg-source.tar.xz"])}
+        dependency = {"name": "ffmpeg", "source": source, "recipe": "homebrew/recipe.rb",
+                      "receipt": "homebrew/receipt.json", "metadata": "homebrew/formula.json",
+                      "notices": ["homebrew/COPYING"]}
+        mac_sources.update({
+            "homebrew/recipe.rb": b"build instructions", "homebrew/receipt.json": b"{}",
+            "homebrew/COPYING": b"GPL license", "homebrew/formula.json": macos_sources.json_bytes({
+                "urls": {"stable": {"url": source["url"], "checksum": source["sha256"]}},
+            }),
+        })
+        mac_sources["SOURCE.json"] = macos_sources.json_bytes({
+            "platform": "macos", "cuepool_commit": "a" * 40, "homebrew": [dependency],
+            "libraries": [{"name": "libavcodec.dylib", "formula": "ffmpeg", "uuids": ["BUILD"]}],
+        })
+        macos_sources.write_archive(self.root / release.ARTIFACTS[4], mac_sources)
 
     def test_failed_or_skipped_packaging_never_mutates_github(self):
         for status in ("failure", "cancelled", "skipped", ""):
@@ -50,9 +69,26 @@ class ReleaseTests(unittest.TestCase):
             release.validate_artifacts(self.root, "success", "success")
 
     def test_missing_source_access_blocks_publication(self):
-        (self.root / release.ARTIFACTS[3]).unlink()
+        for name in release.ARTIFACTS[3:]:
+            source = self.root / name
+            saved = source.read_bytes()
+            source.unlink()
+            with self.subTest(artifact=name), patch.object(release, "find_release", return_value=None), patch.object(release, "api") as api:
+                with self.assertRaisesRegex(ValueError, "Missing"):
+                    release.publish("v0.12.3", "a" * 40, self.root, "success", "success")
+                api.assert_not_called()
+            source.write_bytes(saved)
+
+    def test_macos_sources_for_another_commit_block_publication(self):
+        path = self.root / release.ARTIFACTS[4]
+        with zipfile.ZipFile(path) as archive:
+            files = {name: archive.read(name) for name in archive.namelist() if name != "SHA256SUMS"}
+        manifest = json.loads(files["SOURCE.json"])
+        manifest["cuepool_commit"] = "b" * 40
+        files["SOURCE.json"] = macos_sources.json_bytes(manifest)
+        macos_sources.write_archive(path, files)
         with patch.object(release, "find_release", return_value=None), patch.object(release, "api") as api:
-            with self.assertRaisesRegex(ValueError, "Missing"):
+            with self.assertRaisesRegex(ValueError, "different CuePool commit"):
                 release.publish("v0.12.3", "a" * 40, self.root, "success", "success")
             api.assert_not_called()
 

@@ -152,6 +152,10 @@ jobs:
             install_name_tool -delete_rpath "$rp" "$BIN" 2>/dev/null || true
           done
           install_name_tool -add_rpath @executable_path/../Frameworks "$BIN"
+          # Inspect the unmodified build binary to retain the original Homebrew
+          # dependency paths, then check coverage of the bundled dylibs.
+          python3 .github/scripts/macos_sources.py --binary target/release/cuepool \
+            --resources "$APP/Contents/Resources" --output out/cuepool-macos-sources.zip
           codesign --force --deep -s - "$APP"
           hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$APP" -ov -format UDZO \
             out/cuepool-macos-arm64.dmg

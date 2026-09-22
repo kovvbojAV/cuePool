@@ -44,6 +44,14 @@ After building the release binary, create a local `dist/CuePool.app` with:
 The script uses the same bundle template and icon as the release workflow.
 Run it again after rebuilding the binary.
 
+Release builds also include CuePool and dependency notices under
+`Contents/Resources` and publish `cuepool-macos-sources.zip`. The collector follows
+the original executable's dylib dependencies, records the exact installed
+Homebrew source recipes and receipts, and checks coverage of the libraries
+copied into the app. It runs before signing. The Windows source archive describes
+a different dependency build and does not replace this macOS index. See
+[macOS source access](macos-sources.md).
+
 The app is ad-hoc signed, not notarized. If macOS blocks first launch, approve
 it under **System Settings → Privacy & Security**.
 

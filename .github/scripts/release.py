@@ -16,10 +16,11 @@ import tomllib
 import zipfile
 
 import windows_sources
+import macos_sources
 
 REPOSITORY = "kovvbojAV/cuePool"
 ARTIFACTS = ("cuepool-macos-arm64.dmg", "cuepool-windows-x86_64.zip", "cuepool-windows-x86_64.msi",
-             "cuepool-windows-sources.zip")
+             "cuepool-windows-sources.zip", "cuepool-macos-sources.zip")
 MACOS_NOTE = ("**macOS:** the app is ad-hoc signed, not notarized. On first launch, "
               "right-click → Open, or approve it in System Settings → Privacy & Security.")
 RELEASE_COMMIT = re.compile(r"^(feat|fix)(\([^)]*\))?!?:|^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:", re.M)
@@ -200,6 +201,7 @@ def validate_artifacts(directory, build_result, verification_result, sha=None):
         if stream.read(4) != b"koly":
             raise ValueError("Invalid DMG trailer")
     windows_sources.validate_archive(paths[ARTIFACTS[3]], sha)
+    macos_sources.validate_archive(paths[ARTIFACTS[4]], sha)
     return paths
 
 
@@ -311,6 +313,7 @@ def publish(tag, sha, directory, build_result, verification_result):
         return
     body = (release_notes(tag) + "\n\n" + MACOS_NOTE
             + f"\n\n**Windows source:** [source snapshots and dependency/build index](https://github.com/{REPOSITORY}/releases/download/{tag}/cuepool-windows-sources.zip)."
+            + f"\n\n**macOS source:** [matching Homebrew recipes, notices and source index](https://github.com/{REPOSITORY}/releases/download/{tag}/cuepool-macos-sources.zip)."
             + f"\n\n<!-- cuepool-source: {sha} -->\n")
     if release:
         claimed = re.findall(r"<!-- cuepool-source: (.*?) -->", release.get("body") or "")

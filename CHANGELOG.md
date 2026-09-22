@@ -24,6 +24,7 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 - Verify Windows runtime loading, installation, six-product legacy upgrades, failed-upgrade recovery and user-data preservation before publication.
 - Pin the ASIO SDK and rebuild its cached native output when preparing Windows packages.
 - Pin the FFmpeg SDK and include a checksummed Windows source archive with source snapshots, dependency indexes and native build recipes.
+- Include macOS dependency notices in the app and publish matching source directions and exact Homebrew build recipes alongside the DMG.
 
 ## [0.12.3]
 

@@ -95,14 +95,16 @@ tag. It then builds and packages that same SHA on macOS and Windows.
 
 A read-only prerequisite gate runs even on artifacts-only rehearsals and failed
 builds. The final publication job requires that gate to pass, including successful
-verification and both platform jobs. It also requires exactly one nonempty DMG, portable ZIP and MSI, validates
+verification and both platform jobs. It also requires exactly one nonempty DMG,
+portable ZIP, MSI and source archive for each platform, validates
 their basic container structure, and checks the ZIP contains the executable and
 runtime DLLs. The Windows job additionally runs the portable executable with a
 clean runtime path and exercises MSI installation, upgrade, uninstall and rollback
 on its disposable hosted runner. Profile/project preservation and installed
 payload hashes are checked; logs are retained as `windows-package-validation`.
 Windows builds explicitly enable ASIO; production packages omit the test harness.
-macOS packaging verifies the DMG and application signature.
+macOS packaging verifies the DMG and application signature, includes dependency
+notices in the app, and checks that its source index covers every bundled dylib.
 
 The publication script creates or reuses a **draft**, writes the exact changelog
 notes and source attestation (rejecting conflicting source claims), uploads the packages and
@@ -249,3 +251,17 @@ FFmpeg source and BtbN build-script snapshots together. Verify the SDK's D3D12VA
 layout, Windows loader and media playback before promotion. Preserve the source
 asset as long as its binary release is offered; upstream BtbN monthly assets
 have a two-year retention policy.
+
+## macOS dependency sources
+
+`cuepool-macos-sources.zip` is also required for publication and remote readback.
+It records the libraries actually linked by the original Cargo binary and
+compares that inventory with the dylibs copied into the app. Source directions,
+installed license/notice files, exact Homebrew keg recipes and installation
+receipts accompany CuePool's source snapshot and Rust dependency index.
+
+Use installed keg metadata, not the current Homebrew formula API: the latest
+formula may already describe a different version. Collect notices into the app
+before signing and creating the DMG. The macOS source archive is separate from
+the Windows archive because the platforms can ship different FFmpeg builds and
+dependency sets. See [macOS source access](../packaging/macos-sources.md).
