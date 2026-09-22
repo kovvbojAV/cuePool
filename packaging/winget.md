@@ -39,6 +39,19 @@ manifest is committed here with placeholders. `package-validation/result.json`
 records the tested MSI's version, SHA256, ProductCode and UpgradeCode. Compare
 it with the public download before submission.
 
+For the first submission, run **Validate WinGet submission** in GitHub Actions
+with the published version (for example `0.13.0`). This workflow downloads the
+public MSI and checksum manifest, verifies its actual product identity, creates
+the three schema-1.12 manifests, and tests validation, installation and removal
+through WinGet on a disposable Windows runner. Use the manifest files from its
+`cuepool-winget-submission` artifact only after the job succeeds; the workflow
+does not submit a PR. It also retains the WinGet diagnostic logs.
+
+The same generation step can run on Windows with
+`.github/scripts/prepare-winget.ps1 -Version <published-version>`. It requires a
+public stable release and refuses to overwrite an existing manifest directory.
+The manual steps below remain available with Microsoft's manifest tool.
+
 1. Install Microsoft's manifest tool with `winget install Microsoft.WingetCreate`.
 2. Run `wingetcreate new <exact-public-msi-url>` and use the metadata above.
    WinGet supplies standard MSI silent switches; no custom installer script or

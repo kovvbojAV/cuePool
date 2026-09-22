@@ -1,0 +1,62 @@
+name: Validate WinGet submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published CuePool version, without v'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare manifests from the public installer
+        shell: pwsh
+        env:
+          CUEPOOL_VERSION: ${{ inputs.version }}
+        run: .github/scripts/prepare-winget.ps1 -Version $env:CUEPOOL_VERSION
+      - name: Install the WinGet validation client
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Install-Module Microsoft.WinGet.Client -RequiredVersion 1.29.380 -Force -Scope CurrentUser -Repository PSGallery
+          Import-Module Microsoft.WinGet.Client -RequiredVersion 1.29.380
+          Repair-WinGetPackageManager -Version 1.29.380 -Force
+          winget --version
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet client setup failed' }
+      - name: Validate, install and uninstall through WinGet
+        shell: pwsh
+        env:
+          CUEPOOL_VERSION: ${{ inputs.version }}
+        run: |
+          $manifest = "winget-manifests/manifests/b/BlueJayLouche/CuePool/$env:CUEPOOL_VERSION"
+          winget validate --manifest $manifest
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest validation failed' }
+          winget settings --enable LocalManifestFiles
+          if ($LASTEXITCODE -ne 0) { throw 'Local manifest setup failed' }
+          winget install --manifest $manifest --silent --scope machine --accept-source-agreements --accept-package-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet installation failed' }
+          $exe = Join-Path $env:ProgramFiles 'CuePool/cuepool.exe'
+          $identity = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or ($identity -join "`n") -notmatch ('(?m)^CuePool ' + [regex]::Escape($env:CUEPOOL_VERSION) + '(\s|$)')) {
+              throw 'Installed CuePool version differs from the manifest'
+          }
+          # Before repository acceptance, ARP matching supplies the uninstall entry.
+          winget uninstall --name CuePool --exact --silent --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0 -or (Test-Path $exe)) { throw 'WinGet uninstallation failed' }
+      - name: Retain manifests and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cuepool-winget-submission
+          path: |
+            winget-manifests/
+            ~/AppData/Local/Packages/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe/LocalState/DiagOutputDir/
+          if-no-files-found: error
