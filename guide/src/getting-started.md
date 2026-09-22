@@ -14,7 +14,12 @@ cargo run --release --locked -p cuepool
 
 ```text
 cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]
+cuepool --version
 ```
+
+`--version` prints the version, source identity and compiled ASIO support, then
+exits without opening windows, loading settings or accessing audio devices.
+Use it on its own, including while another CuePool instance is running.
 
 Use `--project <path>` or a single positional path to open a project at startup.
 When running through Cargo, put app options after `--`:

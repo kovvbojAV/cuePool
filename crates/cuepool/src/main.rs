@@ -5198,8 +5198,7 @@ fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
-const CLI_USAGE: &str =
-    "Usage: cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]";
+const CLI_USAGE: &str = "Usage: cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]\n       cuepool --version";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
@@ -5319,6 +5318,22 @@ fn optional_feature_candidates(
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from("--version")])
+    {
+        println!("CuePool {}", cuepool_core::build_identity::BUILD.display);
+        println!(
+            "ASIO: {}",
+            if cfg!(all(windows, feature = "asio")) {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        return Ok(());
+    }
+
     let profile = AppProfile::from_env()
         .map_err(|message| startup_error("Could not start CuePool", message))?;
     let log_file = match cuepool_gui::logging::init_logger(&profile.persistent_log_path()) {
@@ -5329,7 +5344,7 @@ fn main() -> anyhow::Result<()> {
     human_panic::setup_panic!(
         Metadata::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .authors("CuePool Contributors")
-            .homepage("https://github.com/BlueJayLouche/CuePool")
+            .homepage("https://github.com/kovvbojAV/cuePool")
     );
     let human_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
