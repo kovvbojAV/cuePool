@@ -73,15 +73,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_ref || github.sha }}
+      - name: Test Windows packaging tools
+        shell: pwsh
+        run: .github/scripts/test-windows-packaging-tools.ps1
+      - name: Rehearse MSI mechanics with a synthetic payload
+        shell: pwsh
+        run: .github/scripts/test-windows-installer-mechanics.ps1 -LogDir installer-mechanics-validation
+      - name: Upload synthetic MSI rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-mechanics-validation
+          path: installer-mechanics-validation/
+          if-no-files-found: ignore
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test Windows packaging tools
-        shell: pwsh
-        run: .github/scripts/test-windows-packaging-tools.ps1
       - uses: ./.github/actions/setup-windows-deps
       # Match the release build so Windows failures are caught before tagging.
       - run: cargo build --release --locked -p cuepool --features asio

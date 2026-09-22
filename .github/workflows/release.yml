@@ -159,6 +159,7 @@ jobs:
           codesign --verify --deep --strict "$APP"
 
       - name: Package (Windows)
+        id: package_windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -193,6 +194,9 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload artifact
+        # Retain completed Windows packages when a later source/rehearsal step
+        # fails. Publication still requires the entire build job to succeed.
+        if: always() && (success() || (runner.os == 'Windows' && steps.package_windows.outcome == 'success'))
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cuepool-${{ matrix.os }}
