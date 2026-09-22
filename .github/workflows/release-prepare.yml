@@ -37,7 +37,7 @@ jobs:
       - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         if: steps.candidate.outputs.ready == 'true'
         with:
-          tool: release-plz@0.3.162
+          tool: release-plz@0.3.169
       - name: Maintain product release PR
         if: steps.candidate.outputs.ready == 'true'
         env:

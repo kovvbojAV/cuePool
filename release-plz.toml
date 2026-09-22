@@ -21,6 +21,32 @@ changelog_update = true
 changelog_path = "CHANGELOG.md"
 changelog_include = ["cuepool-core", "cuepool-audio", "cuepool-gui", "cuepool-video", "cuepool-protocols", "cuepool-harness"]
 
+# Workspace set-version requires a changelog path for every inheriting member.
+# Only cuepool enables normal changelog generation; all members share its file.
+[[package]]
+name = "cuepool-core"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "cuepool-audio"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "cuepool-gui"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "cuepool-video"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "cuepool-protocols"
+changelog_path = "CHANGELOG.md"
+
+[[package]]
+name = "cuepool-harness"
+changelog_path = "CHANGELOG.md"
+
 [changelog]
 protect_breaking_commits = true
 commit_parsers = [

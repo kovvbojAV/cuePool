@@ -107,3 +107,6 @@ if __name__ == "__main__":
     exercise("feat: extend headless show behavior", "crates/cuepool-harness/src/lib.rs", "pub fn feature() {}\n", "0.13.0", "Application features")
     exercise("refactor: revise cue model\n\nBREAKING CHANGE: cue data requires conversion", "crates/cuepool-core/src/lib.rs", "pub fn changed() {}\n", "0.13.0", "breaking")
     exercise("feat!: change the show contract", "crates/cuepool-core/src/lib.rs", "pub fn breaking() {}\n", "0.13.0", "breaking")
+    # This job has the pinned tool; other Python jobs can skip its real-tool case.
+    subprocess.run(["python3", "-m", "unittest", "discover", "-s", str(ROOT / ".github/scripts"),
+                    "-p", "test_prepare_release.py"], check=True)

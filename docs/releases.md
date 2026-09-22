@@ -5,7 +5,7 @@ The canonical source and release repository is
 
 CuePool has one product version in `[workspace.package]`, inherited by every
 internal crate, one `CHANGELOG.md`, and product tags named `vX.Y.Z`. Release-plz
-0.3.162 prepares changes entirely from Git; registry publication is disabled in
+0.3.169 prepares changes entirely from Git; registry publication is disabled in
 its configuration. We run its `update` and `release-pr` commands, never
 `cargo publish` or `release-plz release`.
 
@@ -174,7 +174,7 @@ While that policy applies, disable only the **Release preparation** workflow in
 Actions to avoid repeated bot-PR failures. Keep **CI** and **Release** enabled:
 publication and receipt recovery do not depend on release preparation. Re-enable
 the preparation workflow if automated PRs become permitted.
-Install the pinned `release-plz 0.3.162`, then start from a clean checkout:
+Install the pinned `release-plz 0.3.169`, then start from a clean checkout:
 
 ```sh
 git fetch origin main --tags
@@ -193,6 +193,29 @@ AGENTS.md. Commit the proposal, push the branch, and open a PR against `main` in
 actual proposed version. Existing GitHub CLI authentication is sufficient for
 `gh pr create --repo kovvbojAV/cuePool`; do not pass it to release-plz or create a
 long-lived workflow credential.
+
+For an installer-only fix outside the Cargo packages, ordinary `update` may find
+no crate changes. Use the explicit local preparation mode instead:
+
+```sh
+python3 scripts/prepare-release.py update --packaging-patch
+```
+
+This mode requires a clean checkout, the ancestral current-version tag, and a
+`fix:` commit that changes an installer or packaging input. It rejects application
+files, Cargo manifests/lockfiles, unrelated paths, features and breaking changes
+anywhere in the new first-parent history. Packaging documentation, tests and
+release tooling may accompany the fix. It increments only the patch version,
+prepares notes without changing earlier releases, and delegates workspace and
+lockfile edits to `release-plz set-version` in a temporary clone. Only the verified
+Cargo.toml, Cargo.lock and CHANGELOG.md are copied back; external dependencies and
+all inherited crate versions remain checked. `release-pr --packaging-patch` is
+unsupported: review the local proposal and open the maintainer PR as above.
+
+The 0.3.169 tool pin is needed for upstream
+[workspace-preserving set-version support](https://github.com/release-plz/release-plz/pull/3047).
+Every internal package maps to the same root changelog for this command; only
+`cuepool` enables changelog generation during ordinary `update`.
 
 CI on a maintainer-created PR runs through the normal pull-request event. Review
 and merge it after all required checks pass. The main push then starts the same
@@ -218,12 +241,13 @@ python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 python3 scripts/test-release-policy.py
 ```
 
-The policy test requires release-plz 0.3.162 on PATH (or `RELEASE_PLZ` pointing to
+The policy test requires release-plz 0.3.169 on PATH (or `RELEASE_PLZ` pointing to
 it). It exercises the production wrapper and real `release-plz update` in temporary
 workspaces with the same crate names and inherited version: fix, feature, harness
 feature, crate/root-manifest/lockfile dependencies, docs inside/outside crates,
 CI-only and breaking changes. It checks every lockfile version, the single changelog and an
-unrelated older locked dependency. It never creates a remote PR or publishes.
+unrelated older locked dependency. It also exercises the explicit packaging patch
+and its rejection guards against the real tool. It never creates a remote PR or publishes.
 
 A passing Linux suite does not prove Windows or macOS packaging. If the Windows
 AprilTag build still lacks pthread.h, its build job must fail and publication must
