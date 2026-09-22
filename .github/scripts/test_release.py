@@ -94,7 +94,7 @@ class ReleaseTests(unittest.TestCase):
     def test_receipt_requires_publication_and_matching_source(self):
         with self.assertRaisesRegex(ValueError, "unpublished"):
             release.record_publication("v0.12.3", "a" * 40, {"draft": True})
-        public = {"draft": False, "tag_name": "v0.12.3", "html_url": "https://github.com/BlueJayLouche/cuePool/releases/tag/v0.12.3", "published_at": "today"}
+        public = {"draft": False, "tag_name": "v0.12.3", "html_url": "https://github.com/kovvbojAV/cuePool/releases/tag/v0.12.3", "published_at": "today"}
         with patch.object(release, "api", side_effect=[None, {"sha": "receipt-object"}, None]) as api:
             release.record_publication("v0.12.3", "a" * 40, public)
             annotation = api.call_args_list[1].args[2]
@@ -116,6 +116,21 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(values["active"], expected)
                 self.assertEqual(values["sha"], sha)
                 self.assertEqual(values["tag"], "v0.13.0" if expected == "true" else "")
+
+    def test_artifacts_only_dispatch_does_not_select_a_publication_tag(self):
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "workflow_dispatch",
+                                     "GITHUB_REF": "refs/heads/main", "RELEASE_TAG": ""}), \
+             patch.object(release, "validate_workspace", return_value="0.13.0"), \
+             patch.object(release, "git", return_value="a" * 40), \
+             patch.object(release, "api") as api, \
+             patch.object(release, "find_release") as find, \
+             patch.object(release, "output") as output:
+            release.resolve_candidate()
+        self.assertEqual(output.call_args.args[0], {
+            "active": "true", "tag": "", "sha": "a" * 40, "published": "false",
+        })
+        api.assert_not_called()
+        find.assert_not_called()
 
     def test_older_retry_does_not_become_latest(self):
         releases = [

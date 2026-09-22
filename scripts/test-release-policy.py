@@ -29,7 +29,7 @@ def exercise(subject, filename, content, expected, expected_group=None):
         run(root, "git", "init", "-b", "main")
         run(root, "git", "config", "user.name", "Release policy test")
         run(root, "git", "config", "user.email", "release@example.invalid")
-        (root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nresolver="3"\n[workspace.package]\nversion = "0.12.3"\nedition="2024"\nrepository="https://github.com/BlueJayLouche/cuePool"\n')
+        (root / "Cargo.toml").write_text('[workspace]\nmembers=["crates/*"]\nresolver="3"\n[workspace.package]\nversion = "0.12.3"\nedition="2024"\nrepository="https://github.com/kovvbojAV/cuePool"\n')
         (root / ".gitignore").write_text("target/\n")
         for name in NAMES:
             crate = root / "crates" / name

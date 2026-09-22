@@ -64,7 +64,7 @@ adding a cue, playing it with **Space**, and saving your project.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build requirements, checks, and a map
 of the codebase. Report bugs or suggest improvements in
-[GitHub issues](https://github.com/BlueJayLouche/cuePool/issues).
+[GitHub issues](https://github.com/kovvbojAV/cuePool/issues).
 
 ## Credits and license
 

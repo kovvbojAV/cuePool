@@ -15,7 +15,7 @@ import tempfile
 import tomllib
 import zipfile
 
-REPOSITORY = "BlueJayLouche/cuePool"
+REPOSITORY = "kovvbojAV/cuePool"
 ARTIFACTS = ("cuepool-macos-arm64.dmg", "cuepool-windows-x86_64.zip", "cuepool-windows-x86_64.msi")
 MACOS_NOTE = ("**macOS:** the app is ad-hoc signed, not notarized. On first launch, "
               "right-click → Open, or approve it in System Settings → Privacy & Security.")

@@ -1,5 +1,8 @@
 # Preparing and publishing CuePool
 
+The canonical source and release repository is
+[`kovvbojAV/cuePool`](https://github.com/kovvbojAV/cuePool).
+
 CuePool has one product version in `[workspace.package]`, inherited by every
 internal crate, one `CHANGELOG.md`, and product tags named `vX.Y.Z`. Release-plz
 0.3.162 prepares changes entirely from Git; registry publication is disabled in
@@ -137,12 +140,13 @@ No custom GitHub App, private key, personal access token or crates.io token is n
 The job requests Contents and Pull requests write permissions; other jobs keep
 their existing permissions.
 
-The repository owner must enable **Settings → Actions → General → Workflow
-permissions → Allow GitHub Actions to create and approve pull requests** if it is
-not already enabled. The workflow declares its required write permissions, so
+For automated release PRs, the repository owner must enable **Settings → Actions
+→ General → Workflow permissions → Allow GitHub Actions to create and approve
+pull requests** if the organisation policy permits it. The workflow declares its required write permissions, so
 there is no need to change the default token permission for all workflows.
 After setup, run **Actions → Release preparation → Run workflow** on `main` to
-create or refresh the proposal. If GitHub refuses PR creation, check that setting.
+create or refresh the proposal. If GitHub refuses PR creation and the organisation
+policy prevents enabling the setting, use the maintainer procedure below.
 Despite the setting's name, this workflow never approves or merges its own PR.
 
 GitHub puts CI runs for PRs created or updated with `GITHUB_TOKEN` into an
@@ -152,6 +156,38 @@ After the bot updates a release PR, approve the checks for its latest revision.
 Wait for those checks, review the version/changelog and update minor-release welcome
 copy before squash merging. Do not interpret pending or approval-required checks
 as a pass. See [GitHub's token event rules](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+
+### Maintainer release PR when bot PRs are disabled
+
+The current organisation policy prevents GitHub Actions from creating PRs. A
+maintainer can prepare the same proposal locally and open a normal PR using their
+existing GitHub login. No policy change or additional repository secret is needed.
+Install the pinned `release-plz 0.3.162`, then start from a clean checkout:
+
+```sh
+git fetch origin main --tags
+git switch --create release/cuepool-next origin/main
+python3 .github/scripts/release.py can-prepare
+python3 scripts/prepare-release.py update
+git diff -- Cargo.toml Cargo.lock CHANGELOG.md
+```
+
+Continue only if `can-prepare` reports `ready=true`. The wrapper enforces the same
+Git baseline, version and dependency checks used by automation, but `update` makes
+no remote changes. Review the proposed version and changelog. For a minor bump,
+update the welcome copy and `RELEASE_NOTES_VERSION` before running the checks in
+AGENTS.md. Commit the proposal, push the branch, and open a PR against `main` in
+`kovvbojAV/cuePool`. Use a title such as `chore: release CuePool 0.13.0` with the
+actual proposed version. Existing GitHub CLI authentication is sufficient for
+`gh pr create --repo kovvbojAV/cuePool`; do not pass it to release-plz or create a
+long-lived workflow credential.
+
+CI on a maintainer-created PR runs through the normal pull-request event. Review
+and merge it after all required checks pass. The main push then starts the same
+verified publication workflow described above. A green Release run that reports
+`active=false` means the workspace still names an older existing tag; it is not
+evidence that new installers were built. Do not move that tag or reuse its version
+for changed source.
 
 Publication uses the job-scoped GITHUB_TOKEN with Contents write. The verification
 and packaging jobs continue in the **same release workflow** after it creates a

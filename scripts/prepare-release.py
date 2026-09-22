@@ -19,7 +19,7 @@ import tomllib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".github/scripts"))
 from release import validate_workspace, product_version, tag_name, release_eligible
 
-REPOSITORY = "https://github.com/BlueJayLouche/cuePool"
+REPOSITORY = "https://github.com/kovvbojAV/cuePool"
 TOOL = os.environ.get("RELEASE_PLZ", "release-plz")
 
 

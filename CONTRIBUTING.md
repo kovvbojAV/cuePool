@@ -12,7 +12,7 @@ checkout. Install Rust through [rustup](https://rustup.rs/), then clone the
 repository:
 
 ```sh
-git clone https://github.com/BlueJayLouche/cuePool.git
+git clone https://github.com/kovvbojAV/cuePool.git
 cd cuePool
 ```
 

@@ -55,8 +55,8 @@ OSC receive/transmit ports and the network interface live in
 
 ## Developer documentation
 
-See [Contributing](https://github.com/BlueJayLouche/cuePool/blob/main/CONTRIBUTING.md)
+See [Contributing](https://github.com/kovvbojAV/cuePool/blob/main/CONTRIBUTING.md)
 for build requirements, checks, and a map of the codebase. The
-[automation API](https://github.com/BlueJayLouche/cuePool/blob/main/docs/AUTOMATION.md)
-and [pixel feed](https://github.com/BlueJayLouche/cuePool/blob/main/docs/PIXEL_FEED.md)
+[automation API](https://github.com/kovvbojAV/cuePool/blob/main/docs/AUTOMATION.md)
+and [pixel feed](https://github.com/kovvbojAV/cuePool/blob/main/docs/PIXEL_FEED.md)
 have separate references.

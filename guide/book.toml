@@ -8,7 +8,7 @@ src = "src"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 site-url = "/cuePool/"
-git-repository-url = "https://github.com/BlueJayLouche/cuePool"
+git-repository-url = "https://github.com/kovvbojAV/cuePool"
 additional-css = ["theme/custom.css"]
 
 [output.html.fold]

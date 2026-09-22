@@ -88,9 +88,9 @@ fn published(root: &Path, tag: &str) -> bool {
         && entry["published_at"]
             .as_str()
             .is_some_and(|s| !s.is_empty())
-        && entry["url"].as_str().is_some_and(|s| {
-            s.starts_with("https://github.com/BlueJayLouche/cuePool/releases/tag/")
-        })
+        && entry["url"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("https://github.com/kovvbojAV/cuePool/releases/tag/"))
 }
 
 fn fingerprint(root: &Path, status: &[u8]) -> Option<String> {

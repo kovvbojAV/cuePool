@@ -92,7 +92,7 @@ fn tag_dirty_archive_and_publication_are_distinct() {
         "v0.12.3 (version tag; publication unverified)"
     );
     let proof = format!(
-        r#"{{"tag":"v0.12.3","commit":"{first}","url":"https://github.com/BlueJayLouche/cuePool/releases/tag/v0.12.3","published_at":"2026-09-08T00:00:00Z"}}"#
+        r#"{{"tag":"v0.12.3","commit":"{first}","url":"https://github.com/kovvbojAV/cuePool/releases/tag/v0.12.3","published_at":"2026-09-08T00:00:00Z"}}"#
     );
     run(
         &repo.0,

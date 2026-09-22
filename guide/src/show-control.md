@@ -78,7 +78,7 @@ replies, throttle previews and always confirm the final adjustment. After
 repeated timeouts, mark state unavailable and refresh by reading on reconnect.
 Do not send another setter in response to feedback. A complete recipe, slider,
 integration contract and automated tests are in
-[`examples/nodel-volume`](https://github.com/BlueJayLouche/cuePool/tree/main/examples/nodel-volume).
+[`examples/nodel-volume`](https://github.com/kovvbojAV/cuePool/tree/main/examples/nodel-volume).
 
 OSC uses UDP here: IDs correlate replies but do not provide delivery guarantees,
 server-side deduplication or global ordering between different senders. Clients

@@ -121,8 +121,13 @@ jobs:
           package_id="$(cargo pkgid -p cuepool)"
           echo "VERSION=${package_id##*#}" >> "$GITHUB_ENV"
 
-      - name: Build
-        run: cargo build --release --locked -p cuepool --all-features
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked -p cuepool
+
+      - name: Build with ASIO (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p cuepool --features asio
 
       - name: Package (macOS)
         if: runner.os == 'macOS'

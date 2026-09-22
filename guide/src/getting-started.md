@@ -3,7 +3,7 @@
 ## Build & run
 
 CuePool needs Rust and native audio/video development libraries. Follow the
-[platform setup instructions](https://github.com/BlueJayLouche/cuePool/blob/main/CONTRIBUTING.md#building-from-source),
+[platform setup instructions](https://github.com/kovvbojAV/cuePool/blob/main/CONTRIBUTING.md#building-from-source),
 then run from the repository root:
 
 ```sh
@@ -39,7 +39,7 @@ the zero-copy path is enabled only when its value is exactly `1`. Either
 command-line option takes precedence over that environment variable.
 
 For separate process profiles and API control, see the
-[automation reference](https://github.com/BlueJayLouche/cuePool/blob/main/docs/AUTOMATION.md).
+[automation reference](https://github.com/kovvbojAV/cuePool/blob/main/docs/AUTOMATION.md).
 
 ## Your first show
 
