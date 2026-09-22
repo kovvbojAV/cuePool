@@ -34,7 +34,7 @@ jobs:
         if: steps.candidate.outputs.ready == 'true'
         with:
           toolchain: 1.97.1
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         if: steps.candidate.outputs.ready == 'true'
         with:
           tool: release-plz@0.3.169
