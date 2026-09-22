@@ -167,10 +167,14 @@ $upgradeCode = Read-MsiProperty $Msi 'UpgradeCode'
 $results.product_code = $productCode
 $results.upgrade_code = $upgradeCode
 $results.publisher = Read-MsiProperty $Msi 'Manufacturer'
-if ((Read-MsiProperty $Msi 'ProductVersion') -ne $Version -or
-    (Read-MsiProperty $Msi 'ProductName') -ne 'CuePool' -or
-    (Read-MsiProperty $Msi 'ALLUSERS') -ne '1' -or $results.publisher -ne 'BlueJayLouche') {
-    throw 'MSI identity, scope or version does not match the release'
+$expectedIdentity = [ordered]@{ ProductVersion = $Version; ProductName = 'CuePool'; ALLUSERS = '1'; Manufacturer = 'BlueJayLouche' }
+$actualIdentity = [ordered]@{}
+foreach ($property in $expectedIdentity.Keys) { $actualIdentity[$property] = Read-MsiProperty $Msi $property }
+$actualIdentity | ConvertTo-Json | Set-Content (Join-Path $LogDir 'msi-identity.json')
+foreach ($property in $expectedIdentity.Keys) {
+    if ($actualIdentity[$property] -ne $expectedIdentity[$property]) {
+        throw "MSI $property is $($actualIdentity[$property] | ConvertTo-Json -Compress); expected '$($expectedIdentity[$property])'"
+    }
 }
 # Six same-version products reproduce accumulated legacy MSI registrations.
 # All share component GUIDs; each package gets a distinct ProductCode. This is
