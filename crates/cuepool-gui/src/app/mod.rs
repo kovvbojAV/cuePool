@@ -24,7 +24,7 @@ const MAX_AUTOMATION_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
 /// the previous release's copy with the new version. `release_notes_match_the_release`
 /// fails while this trails the package minor, which is the reminder to rewrite
 /// the modal body before bumping it (see AGENTS.md).
-pub const RELEASE_NOTES_VERSION: &str = "0.12";
+pub const RELEASE_NOTES_VERSION: &str = "0.13";
 
 /// A full snapshot of editable state for undo/redo.
 #[derive(Debug, Clone)]
@@ -2358,9 +2358,9 @@ impl CuePoolApp {
                         .color(egui::Color32::from_rgb(255, 184, 92)),
                 );
                 ui.add_space(4.0);
-                ui.heading("Endings that fade instead of cut");
+                ui.heading("Versioned installs and clearer build details");
                 ui.label(
-                    "A Stop cue can now bring the whole show down gently: its fade applies to Stop All, and a stop aimed at a Group takes every member with it — video, its audio and all.",
+                    "Install a published CuePool release on Windows, check exactly which build is running, and keep remote volume controls in sync with the show.",
                 );
                 ui.add_space(12.0);
                 ui.separator();
@@ -2368,16 +2368,16 @@ impl CuePoolApp {
 
                 for (title, detail) in [
                     (
-                        "Stop All honours its fade",
-                        "A Stop cue with Stop All ticked fades every playing cue and the video out together over the cue's fade time. The transport's Stop button stays an instant cut for emergencies.",
+                        "Windows installers and portable packages",
+                        "Each release includes an MSI installer and a portable ZIP with the required runtime libraries and ASIO support. Your audio device's ASIO driver is still installed separately.",
                     ),
                     (
-                        "Stopping a group stops its members",
-                        "A stop aimed at a Group cue now reaches everything inside it, nested groups included. One cue ends a whole chain smoothly.",
+                        "Check the running build",
+                        "Help > About shows the version and source revision. Help > Changes lists changes from the available release or version-tag baseline, including local edits in development builds.",
                     ),
                     (
-                        "A stop means stop",
-                        "Stopping a cue that is still waiting on its delay cancels it, and a faded Stop All will not fire follow-on cues once the fade lands.",
+                        "Master-volume feedback over OSC",
+                        "Remote controls can query the current master volume and receive updates when it changes. The included Nodel volume control follows changes made in CuePool.",
                     ),
                 ] {
                     ui.label(
@@ -2391,7 +2391,7 @@ impl CuePoolApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Also: camera-based projection auto-blend over OSC (/qplayer/projection/autoblend/…) measures warp, edge blend and gamma for you, with per-output bypass switches for projectors that blend in hardware; volume and pan changes land on a playing cue without restarting it, typing in a cue field no longer fires the show, Show mode locks out every editing path, and undo keeps whole edits instead of their last keystroke.",
+                        "Also: a final Stop All cue no longer rearms the show clock.",
                     )
                     .small()
                     .color(egui::Color32::from_gray(180)),
