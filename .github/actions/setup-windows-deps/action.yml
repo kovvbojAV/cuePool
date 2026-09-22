@@ -1,5 +1,5 @@
 name: Set up Windows dependencies
-description: Install the FFmpeg SDK and static pthreads used by CuePool builds and tests.
+description: Install the FFmpeg/ASIO SDKs and static pthreads used by CuePool builds and tests.
 runs:
   using: composite
   steps:
@@ -17,6 +17,22 @@ runs:
         $dir = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Directory | Select-Object -First 1
         "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
         "$($dir.FullName)\bin" >> $env:GITHUB_PATH
+
+    - name: Install pinned ASIO SDK
+      shell: pwsh
+      run: |
+        # asio-sys otherwise downloads the moving steinberg.net/asiosdk alias.
+        curl.exe --fail -L -o "$env:RUNNER_TEMP\asio.zip" "https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip"
+        if ($LASTEXITCODE -ne 0) { throw "ASIO SDK download failed" }
+        $expected = "d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca"
+        $actual = (Get-FileHash "$env:RUNNER_TEMP\asio.zip" -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $expected) { throw "ASIO 2.3.4 SDK digest mismatch: $actual" }
+        Expand-Archive "$env:RUNNER_TEMP\asio.zip" -DestinationPath "$env:RUNNER_TEMP\asio"
+        $dir = "$env:RUNNER_TEMP\asio\ASIOSDK"
+        if (!(Test-Path "$dir\common\asio.h" -PathType Leaf) -or !(Test-Path "$dir\host\asiodrivers.h" -PathType Leaf)) {
+          throw "ASIO SDK is missing required headers"
+        }
+        "CPAL_ASIO_DIR=$dir" >> $env:GITHUB_ENV
 
     - name: Install pthreads for AprilTag
       shell: pwsh
