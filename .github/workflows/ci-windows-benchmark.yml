@@ -1,0 +1,262 @@
+name: Windows CI benchmark (temporary)
+
+on:
+  push:
+    branches: [perf/windows-ci-benchmark]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cold:
+    name: ${{ matrix.variant }} cold seed
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '9b013aa571bf79db88889815cd6c0c83f8865f84' || github.sha }}
+      - name: Record source
+        shell: pwsh
+        run: git rev-parse HEAD
+      - name: Test Windows packaging tools
+        shell: pwsh
+        run: .github/scripts/test-windows-packaging-tools.ps1
+      - name: Rehearse MSI mechanics with a synthetic payload
+        shell: pwsh
+        run: .github/scripts/test-windows-installer-mechanics.ps1 -LogDir installer-mechanics-validation
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - name: Restore and seed isolated Rust cache
+        if: matrix.variant == 'baseline'
+        id: rust_cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
+          shared-key: windows-ci
+      - name: Assert cold cache
+        if: matrix.variant == 'baseline'
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.rust_cache.outputs.cache-hit }}
+        run: |
+          Write-Host "Rust cache exact hit: $env:CACHE_HIT"
+          if ($env:CACHE_HIT -eq 'true') { throw 'Cold seed unexpectedly restored an exact cache' }
+      - name: Isolate candidate Rust cache
+        if: matrix.variant == 'candidate'
+        shell: pwsh
+        run: |
+          $path = '.github/actions/setup-windows-deps/action.yml'
+          $lines = Get-Content $path
+          $needle = '        key: windows-sdk-v1-'
+          if (@($lines | Where-Object { $_.StartsWith($needle) }).Count -ne 1) {
+            throw 'Expected one Windows SDK cache key in the composite action'
+          }
+          $lines | ForEach-Object {
+            if ($_.StartsWith($needle)) {
+              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        shared-key: windows-ci'
+            }
+            $_
+          } | Set-Content $path
+      - name: Install Windows dependencies (baseline)
+        if: matrix.variant == 'baseline'
+        uses: ./.github/actions/setup-windows-deps
+      - name: Install Windows dependencies (candidate)
+        if: matrix.variant == 'candidate'
+        id: windows_deps
+        uses: ./.github/actions/setup-windows-deps
+        with:
+          save-cache: 'true'
+      - name: Assert cold candidate cache
+        if: matrix.variant == 'candidate'
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.windows_deps.outputs.cache-hit }}
+        run: |
+          Write-Host "Rust cache exact hit: $env:CACHE_HIT"
+          if ($env:CACHE_HIT -eq 'true') { throw 'Cold seed unexpectedly restored an exact cache' }
+      - name: Build release with ASIO
+        run: cargo build --release --locked -p cuepool --features asio --timings
+      - name: Verify desktop subsystem and command-line output
+        run: .github/scripts/test-windows-cli.ps1 -Exe target/release/cuepool.exe -UseBuildEnvironment
+      - name: Verify media decoding with the packaged Windows SDK
+        run: cargo test --profile ${{ matrix.variant == 'candidate' && 'ci-test' || 'release' }} --locked -p cuepool-harness --test headless_show --features cuepool/asio --timings
+      - name: Test AprilTag calibration
+        run: cargo test --profile ${{ matrix.variant == 'candidate' && 'ci-test' || 'release' }} --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame --timings -- --exact
+      - name: Upload synthetic MSI rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-mechanics-${{ matrix.variant }}-cold
+          path: installer-mechanics-validation/
+          if-no-files-found: ignore
+      - name: Upload Cargo timing reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-timings-${{ matrix.variant }}-cold
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+
+  cache-invalidation:
+    name: Candidate SDK cache invalidation
+    needs: cold
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - name: Isolate candidate Rust cache
+        shell: pwsh
+        run: |
+          $path = '.github/actions/setup-windows-deps/action.yml'
+          $lines = Get-Content $path
+          $needle = '        key: windows-sdk-v1-'
+          if (@($lines | Where-Object { $_.StartsWith($needle) }).Count -ne 1) {
+            throw 'Expected one Windows SDK cache key in the composite action'
+          }
+          $lines | ForEach-Object {
+            if ($_.StartsWith($needle)) {
+              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        shared-key: windows-ci'
+            }
+            $_
+          } | Set-Content $path
+      - name: Change SDK manifest bytes and record identity
+        shell: pwsh
+        run: |
+          $path = 'packaging/windows-dependencies.json'
+          $before = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::AppendAllText((Resolve-Path $path).Path, "`n")
+          $after = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          if ($before -eq $after) { throw 'SDK manifest hash did not change' }
+          Write-Host "SDK manifest original SHA256: $before"
+          Write-Host "SDK manifest modified SHA256: $after"
+          Write-Host "Windows image version: $env:ImageVersion"
+      - name: Install Windows dependencies with changed SDK manifest
+        id: windows_deps
+        uses: ./.github/actions/setup-windows-deps
+        with:
+          save-cache: 'false'
+      - name: Assert native cache was invalidated
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.windows_deps.outputs.cache-hit }}
+        run: |
+          Write-Host "Rust cache exact hit: $env:CACHE_HIT"
+          if ($env:CACHE_HIT -eq 'true') { throw 'Changed SDK manifest reused the old cache key' }
+          foreach ($profile in 'release', 'ci-test') {
+            $deps = "target/$profile/deps"
+            if (Test-Path $deps) { throw "Changed SDK manifest restored $deps" }
+            $fingerprint = "target/$profile/.fingerprint"
+            $native = @(Get-ChildItem $fingerprint -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^(ffmpeg-sys-next|asio-sys|apriltag-sys)-' })
+            if ($native.Count -gt 0) { throw "Changed SDK manifest restored native fingerprints in $fingerprint" }
+          }
+
+  warm:
+    name: ${{ matrix.variant }} warm ${{ matrix.sample }}
+    needs: cold
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+        sample: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '9b013aa571bf79db88889815cd6c0c83f8865f84' || github.sha }}
+      - name: Record source
+        shell: pwsh
+        run: git rev-parse HEAD
+      - name: Test Windows packaging tools
+        shell: pwsh
+        run: .github/scripts/test-windows-packaging-tools.ps1
+      - name: Rehearse MSI mechanics with a synthetic payload
+        shell: pwsh
+        run: .github/scripts/test-windows-installer-mechanics.ps1 -LogDir installer-mechanics-validation
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - name: Restore isolated Rust cache
+        if: matrix.variant == 'baseline'
+        id: rust_cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
+          shared-key: windows-ci
+          save-if: 'false'
+      - name: Assert warm cache
+        if: matrix.variant == 'baseline'
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.rust_cache.outputs.cache-hit }}
+        run: |
+          Write-Host "Rust cache exact hit: $env:CACHE_HIT"
+          if ($env:CACHE_HIT -ne 'true') { throw 'Warm sample did not restore the seed cache' }
+      - name: Isolate candidate Rust cache
+        if: matrix.variant == 'candidate'
+        shell: pwsh
+        run: |
+          $path = '.github/actions/setup-windows-deps/action.yml'
+          $lines = Get-Content $path
+          $needle = '        key: windows-sdk-v1-'
+          if (@($lines | Where-Object { $_.StartsWith($needle) }).Count -ne 1) {
+            throw 'Expected one Windows SDK cache key in the composite action'
+          }
+          $lines | ForEach-Object {
+            if ($_.StartsWith($needle)) {
+              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        shared-key: windows-ci'
+            }
+            $_
+          } | Set-Content $path
+      - name: Install Windows dependencies (baseline)
+        if: matrix.variant == 'baseline'
+        uses: ./.github/actions/setup-windows-deps
+      - name: Install Windows dependencies (candidate)
+        if: matrix.variant == 'candidate'
+        id: windows_deps
+        uses: ./.github/actions/setup-windows-deps
+        with:
+          save-cache: 'false'
+      - name: Assert warm candidate cache
+        if: matrix.variant == 'candidate'
+        shell: pwsh
+        env:
+          CACHE_HIT: ${{ steps.windows_deps.outputs.cache-hit }}
+        run: |
+          Write-Host "Rust cache exact hit: $env:CACHE_HIT"
+          if ($env:CACHE_HIT -ne 'true') { throw 'Warm sample did not restore the seed cache' }
+      - name: Build release with ASIO
+        run: cargo build --release --locked -p cuepool --features asio --timings
+      - name: Verify desktop subsystem and command-line output
+        run: .github/scripts/test-windows-cli.ps1 -Exe target/release/cuepool.exe -UseBuildEnvironment
+      - name: Verify media decoding with the packaged Windows SDK
+        run: cargo test --profile ${{ matrix.variant == 'candidate' && 'ci-test' || 'release' }} --locked -p cuepool-harness --test headless_show --features cuepool/asio --timings
+      - name: Test AprilTag calibration
+        run: cargo test --profile ${{ matrix.variant == 'candidate' && 'ci-test' || 'release' }} --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame --timings -- --exact
+      - name: Upload synthetic MSI rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-mechanics-${{ matrix.variant }}-warm-${{ matrix.sample }}
+          path: installer-mechanics-validation/
+          if-no-files-found: ignore
+      - name: Upload Cargo timing reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-timings-${{ matrix.variant }}-warm-${{ matrix.sample }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
