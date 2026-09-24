@@ -62,7 +62,7 @@ jobs:
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
               '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
-              '        shared-key: windows-ci'
+              '        add-job-id-key: "false"'
             }
             $_
           } | Set-Content $path
@@ -127,7 +127,7 @@ jobs:
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
               '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
-              '        shared-key: windows-ci'
+              '        add-job-id-key: "false"'
             }
             $_
           } | Set-Content $path
@@ -217,7 +217,7 @@ jobs:
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
               '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
-              '        shared-key: windows-ci'
+              '        add-job-id-key: "false"'
             }
             $_
           } | Set-Content $path
