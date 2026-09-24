@@ -177,6 +177,254 @@ fn targeted_stops_preserve_the_running_show_clock() {
 }
 
 #[test]
+fn targeted_stops_preserve_a_stopped_show_clock() {
+    for fade_out_time in [0.0, 0.2] {
+        for delay in [0.0, 0.1] {
+            let mut ending = stop(2, TriggerMode::Go, fade_out_time, false);
+            ending.base_mut().delay = Timespan::from_secs_f64(delay);
+            let fixture = Fixture::new(vec![sound(1, TriggerMode::Go), ending]).unwrap();
+            let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+            runner.select(Decimal::TWO).unwrap();
+            runner.go().unwrap();
+            assert_eq!(runner.snapshot().show_elapsed_secs, None);
+            runner.advance_blocks(30).unwrap();
+            assert_eq!(runner.snapshot().show_elapsed_secs, None);
+            assert_eq!(started(&runner.take_trace()), vec![2]);
+        }
+    }
+}
+
+#[test]
+fn preshow_control_chains_keep_timecode_cues_silent() {
+    for trigger in [TriggerMode::WithLast, TriggerMode::AfterLast] {
+        for grouped in [false, true] {
+            for stop_all in [false, true] {
+                let mut feature = sound(1, TriggerMode::Go);
+                feature.base_mut().loop_mode = LoopMode::LoopedInfinite;
+                let mut cues = vec![
+                    feature,
+                    Cue::TimeCode {
+                        base: base(2, TriggerMode::Go),
+                        start_time: Timespan::from_secs_f64(0.05),
+                        duration: Timespan::ZERO,
+                    },
+                    dummy(3, TriggerMode::AfterLast),
+                    Cue::Group {
+                        base: base(4, TriggerMode::Go),
+                    },
+                    stop(5, TriggerMode::Go, 0.2, false),
+                    Cue::Network {
+                        base: base(6, trigger),
+                        command: "/preshow/start".into(),
+                    },
+                    Cue::Lighting {
+                        base: base(7, trigger),
+                        snapshot: Default::default(),
+                        fade_time: 0.2,
+                        fade_type: Default::default(),
+                    },
+                    Cue::Network {
+                        base: base(8, trigger),
+                        command: "/preshow/ready".into(),
+                    },
+                ];
+                if stop_all {
+                    let mut ending = stop(9, trigger, 0.2, true);
+                    ending.base_mut().delay = Timespan::from_secs_f64(0.5);
+                    cues.push(ending);
+                }
+                if grouped {
+                    for cue in &mut cues[4..] {
+                        cue.base_mut().parent = Some(Decimal::from(4));
+                    }
+                }
+                let fixture = Fixture::new(cues).unwrap();
+                let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+                // Re-entering pre-show must be as harmless as the first GO.
+                for _ in 0..2 {
+                    runner
+                        .select(Decimal::from(if grouped { 4 } else { 5 }))
+                        .unwrap();
+                    runner.go().unwrap();
+                    for _ in 0..70 {
+                        assert_eq!(
+                            runner.snapshot().show_elapsed_secs,
+                            None,
+                            "pre-show ({trigger:?}, grouped={grouped}, stop_all={stop_all})"
+                        );
+                        runner.advance_blocks(1).unwrap();
+                    }
+                    let fired = started(&runner.take_trace());
+                    for qid in 5..=if stop_all { 9 } else { 8 } {
+                        assert!(fired.contains(&qid), "pre-show cue {qid} did not execute");
+                    }
+                    assert!(!fired.contains(&3), "show timecode fired during pre-show");
+                }
+
+                // The same timecode must fire when actual playback starts.
+                runner.select(Decimal::ONE).unwrap();
+                runner.go().unwrap();
+                assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.0));
+                runner.advance_blocks(10).unwrap();
+                assert!(started(&runner.take_trace()).contains(&3));
+
+                // Staff returning a running show to pre-show preserve its clock
+                // until the delayed Stop All, when present, actually fires.
+                runner
+                    .select(Decimal::from(if grouped { 4 } else { 5 }))
+                    .unwrap();
+                runner.go().unwrap();
+                assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.1));
+                runner.advance_blocks(49).unwrap();
+                assert_eq!(runner.snapshot().show_elapsed_secs, Some(0.59));
+                runner.advance_blocks(21).unwrap();
+                assert_eq!(
+                    runner.snapshot().show_elapsed_secs,
+                    (!stop_all).then_some(0.8)
+                );
+                assert!(runner.snapshot().active_cues.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn go_starts_the_clock_for_content_and_explicit_timecode_only() {
+    for (cue_type, starts_clock) in [
+        ("SoundCue", true),
+        ("VideoCue", true),
+        ("ImageCue", true),
+        ("TextCue", true),
+        ("PixelMapCue", true),
+        ("DmxShowCue", true),
+        ("TimeCodeCue", true),
+        ("GroupCue", false),
+        ("DummyCue", false),
+        ("StopCue", false),
+        ("VolumeCue", false),
+        ("NetworkCue", false),
+        ("GotoCue", false),
+        ("LightingCue", false),
+    ] {
+        for delay in [0.0, 0.1] {
+            let mut cue: Cue = serde_json::from_value(serde_json::json!({
+                "$type": cue_type,
+                "qid": "1",
+                "path": if cue_type == "VideoCue" { "video.y4m" } else { "tone.wav" },
+            }))
+            .unwrap();
+            cue.base_mut().delay = Timespan::from_secs_f64(delay);
+            let fixture = Fixture::new(vec![cue]).unwrap();
+            let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+            runner.select(Decimal::ONE).unwrap();
+            runner.go().unwrap();
+            assert_eq!(
+                runner.snapshot().show_elapsed_secs,
+                starts_clock.then_some(0.0),
+                "GO on {cue_type} (delay={delay})"
+            );
+            runner.advance_blocks(15).unwrap();
+            assert_eq!(
+                runner.snapshot().show_elapsed_secs,
+                starts_clock.then_some(0.15),
+                "after {cue_type} (delay={delay})"
+            );
+        }
+    }
+}
+
+#[test]
+fn delayed_control_chains_start_the_clock_when_they_lead_to_playback() {
+    for cue_type in [
+        "DummyCue",
+        "NetworkCue",
+        "LightingCue",
+        "VolumeCue",
+        "StopCue",
+    ] {
+        for grouped in [false, true] {
+            for enabled in [false, true] {
+                let mut control: Cue = serde_json::from_value(serde_json::json!({
+                    "$type": cue_type,
+                    "qid": "2",
+                    "stop_qid": "99",
+                    "command": "/prepare/playback",
+                }))
+                .unwrap();
+                control.base_mut().delay = Timespan::from_secs_f64(0.1);
+                let mut feature = sound(3, TriggerMode::AfterLast);
+                feature.base_mut().enabled = enabled;
+                let mut cues = Vec::new();
+                if grouped {
+                    cues.push(Cue::Group {
+                        base: base(1, TriggerMode::Go),
+                    });
+                    control.base_mut().parent = Some(Decimal::ONE);
+                    feature.base_mut().parent = Some(Decimal::ONE);
+                }
+                cues.extend([control, feature]);
+                let fixture = Fixture::new(cues).unwrap();
+                let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+                runner
+                    .select(if grouped { Decimal::ONE } else { Decimal::TWO })
+                    .unwrap();
+                runner.go().unwrap();
+                assert_eq!(
+                    runner.snapshot().show_elapsed_secs,
+                    enabled.then_some(0.0),
+                    "delayed {cue_type} (grouped={grouped}, playback enabled={enabled})"
+                );
+                runner.advance_blocks(9).unwrap();
+                assert!(started(&runner.take_trace()).is_empty());
+                runner.advance_blocks(6).unwrap();
+                assert_eq!(runner.snapshot().show_elapsed_secs, enabled.then_some(0.15));
+                assert_eq!(
+                    started(&runner.take_trace()),
+                    if enabled { vec![2, 3] } else { vec![2] }
+                );
+                assert_eq!(runner.snapshot().active_cues.len(), usize::from(enabled));
+            }
+        }
+    }
+}
+
+#[test]
+fn delayed_groups_only_start_the_clock_for_enabled_content() {
+    for content in [false, true] {
+        for enabled in [false, true] {
+            let mut group = Cue::Group {
+                base: base(1, TriggerMode::Go),
+            };
+            group.base_mut().delay = Timespan::from_secs_f64(0.1);
+            let mut child = if content {
+                sound(2, TriggerMode::Go)
+            } else {
+                Cue::Network {
+                    base: base(2, TriggerMode::Go),
+                    command: "/preshow/start".into(),
+                }
+            };
+            child.base_mut().parent = Some(Decimal::ONE);
+            child.base_mut().enabled = enabled;
+            let fixture = Fixture::new(vec![group, child]).unwrap();
+            let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+            runner.select(Decimal::ONE).unwrap();
+            runner.go().unwrap();
+            assert_eq!(
+                runner.snapshot().show_elapsed_secs,
+                (content && enabled).then_some(0.0)
+            );
+            runner.advance_blocks(15).unwrap();
+            assert_eq!(
+                runner.snapshot().show_elapsed_secs,
+                (content && enabled).then_some(0.15)
+            );
+            assert_eq!(started(&runner.take_trace()).contains(&2), enabled);
+        }
+    }
+}
+
+#[test]
 fn loads_relative_media_and_runs_with_last_and_after_last() {
     let fixture = Fixture::new(vec![
         sound(1, TriggerMode::Go),

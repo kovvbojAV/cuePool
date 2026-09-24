@@ -76,9 +76,10 @@ ints, floats, or strings. See [Show Control](show-control.md#osc).
 
 ### TimeCode
 
-Starts (and scrubs) the show clock that
-[timecode triggers](show-control.md#per-cue-triggers) fire against, with a
-start time and duration.
+Defines a point or interval on the [show clock](show-control.md#show-clock--timecode)
+for AfterLast followers, with a start time and duration. GO on a TimeCode
+cue also starts a stopped clock at zero; it does not seek the clock to the
+cue's start time.
 
 ### Lighting
 

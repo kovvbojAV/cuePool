@@ -481,10 +481,14 @@ impl ShowEngine {
             return;
         }
 
-        // Arm before each cue fired by GO, including Group and AfterLast
-        // members. A RESET's next cue restarts the clock at zero; a terminal
-        // stop-all leaves it stopped. Direct Fire and later ticks cannot rearm it.
-        if self.go_in_progress && self.show_start.is_none() {
+        // Only playback or an explicit TimeCode cue starts a show. Control-only
+        // pre-show chains leave the clock alone, including targeted Stops.
+        // Arm before the playback delay, as GO defines time zero. A RESET's
+        // next playback cue rearms; terminal Stop All, Fire and ticks do not.
+        if self.go_in_progress
+            && self.show_start.is_none()
+            && (cue_starts_show_clock(&cue) || self.delayed_cue_starts_show_clock(&cue))
+        {
             self.show_start = Some(self.now);
             self.show_paused_offset = Duration::ZERO;
             self.show_adjustment_secs = 0.0;
@@ -754,6 +758,43 @@ impl ShowEngine {
                 }
             }
         }
+    }
+
+    /// A delayed chain must retain GO's clock origin even though its content
+    /// dispatches on a later tick. Inspect only enabled cues reachable through
+    /// group dispatch or instant AfterLast follows; a dormant cue is not a start.
+    fn delayed_cue_starts_show_clock(&self, cue: &Cue) -> bool {
+        if cue.base().delay.as_secs_f64() <= 0.0 {
+            return false;
+        }
+        let state = self.state.lock_unpoisoned();
+        let cues = &state.show_file.cues;
+        let mut pending = vec![cue];
+        let mut visited = HashSet::new();
+        while let Some(cue) = pending.pop() {
+            let qid = cue.base().qid;
+            if !cue.enabled() || !visited.insert(qid) {
+                continue;
+            }
+            // A preceding Stop can clear an active, non-retriggerable cue before
+            // dispatch. Leave the active-state guard to play_cue at that time.
+            if cue_starts_show_clock(cue) {
+                return true;
+            }
+            match cue {
+                Cue::Group { .. } => pending.extend(cues.iter().filter(|member| {
+                    member.base().parent == Some(qid)
+                        && member.base().trigger != TriggerMode::AfterLast
+                })),
+                Cue::Stop { .. }
+                | Cue::Volume { .. }
+                | Cue::Network { .. }
+                | Cue::Lighting { .. }
+                | Cue::Dummy { .. } => pending.extend(next_after_last(cues, qid)),
+                _ => {}
+            }
+        }
+        false
     }
 
     // ponytail: Preserve the persisted cue-to-DSP mapping; use a parameter object only if it grows.
@@ -1630,6 +1671,25 @@ fn active_cue_length_samples(cue: &ActiveCue) -> Option<usize> {
     }
 }
 
+fn cue_starts_show_clock(cue: &Cue) -> bool {
+    match cue {
+        Cue::Sound { .. }
+        | Cue::Video { .. }
+        | Cue::Image { .. }
+        | Cue::Text { .. }
+        | Cue::PixelMap { .. }
+        | Cue::DmxShow { .. }
+        | Cue::TimeCode { .. } => true,
+        Cue::Group { .. }
+        | Cue::Dummy { .. }
+        | Cue::Stop { .. }
+        | Cue::Volume { .. }
+        | Cue::Network { .. }
+        | Cue::Goto { .. }
+        | Cue::Lighting { .. } => false,
+    }
+}
+
 fn sanitize_seek(secs: f32) -> f64 {
     if secs.is_nan() || secs <= 0.0 {
         0.0
@@ -2092,7 +2152,15 @@ mod tests {
                     fade_type: Default::default(),
                     stop_all: true,
                 },
-                dummy(2, TriggerMode::WithLast),
+                Cue::Image {
+                    base: CueBase {
+                        qid: Decimal::TWO,
+                        trigger: TriggerMode::WithLast,
+                        ..Default::default()
+                    },
+                    path: "feature.png".into(),
+                    fit: Default::default(),
+                },
             ];
         }
         app
@@ -2136,6 +2204,132 @@ mod tests {
             Some(Duration::ZERO),
             "the second show must not inherit the first show's clock"
         );
+    }
+
+    #[test]
+    fn direct_fire_and_later_ticks_do_not_start_the_show_clock() {
+        for cue_type in ["ImageCue", "TimeCodeCue"] {
+            let mut cue: Cue = serde_json::from_value(serde_json::json!({
+                "$type": cue_type,
+                "qid": "1",
+            }))
+            .unwrap();
+            cue.base_mut().delay = Timespan::from_secs_f64(0.1);
+            let mut engine = ShowEngine::from_show_file(
+                ShowFile {
+                    cues: vec![cue],
+                    ..Default::default()
+                },
+                None,
+                None,
+            );
+            engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+            assert_eq!(engine.show_elapsed(), None);
+            engine.tick(Duration::from_secs(1));
+            assert_eq!(engine.show_elapsed(), None);
+            engine.command(EngineCommand::Select(Decimal::ONE), Duration::from_secs(1));
+            engine.command(EngineCommand::Go, Duration::from_secs(1));
+            assert_eq!(engine.show_elapsed(), Some(Duration::ZERO));
+        }
+    }
+
+    #[test]
+    fn delayed_stop_can_restart_non_retriggerable_content_with_a_show_clock() {
+        for grouped in [true, false] {
+            let app = reset_then_feature_app(0.0);
+            {
+                let mut state = app.state().lock_unpoisoned();
+                let Cue::Stop {
+                    base,
+                    stop_qid,
+                    stop_all,
+                    ..
+                } = &mut state.show_file.cues[0]
+                else {
+                    unreachable!()
+                };
+                *stop_all = false;
+                *stop_qid = Decimal::TWO;
+                base.delay = Timespan::from_secs_f64(if grouped { 0.0 } else { 0.1 });
+                let feature = state.show_file.cues[1].base_mut();
+                feature.trigger = TriggerMode::AfterLast;
+                feature.retriggerable = false;
+                if grouped {
+                    for cue in &mut state.show_file.cues {
+                        cue.base_mut().parent = Some(Decimal::from(3));
+                    }
+                    state.show_file.cues.insert(
+                        0,
+                        Cue::Group {
+                            base: CueBase {
+                                qid: Decimal::from(3),
+                                delay: Timespan::from_secs_f64(0.1),
+                                ..Default::default()
+                            },
+                        },
+                    );
+                    state.selected_cue_id = Some(Decimal::from(3));
+                }
+            }
+            let mut engine = ShowEngine::new(app.state().clone(), None);
+            engine.command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO);
+            assert!(engine.cue_is_active(Decimal::TWO));
+            assert_eq!(engine.show_elapsed(), None);
+
+            engine.command(EngineCommand::Go, Duration::ZERO);
+            assert_eq!(engine.show_elapsed(), Some(Duration::ZERO));
+            let actions = engine.tick(Duration::from_millis(150));
+            assert_eq!(engine.show_elapsed(), Some(Duration::from_millis(150)));
+            assert!(engine.cue_is_active(Decimal::TWO));
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                EngineAction::Trace(EngineTrace::CueStarted { qid, .. }) if *qid == Decimal::TWO
+            )));
+        }
+    }
+
+    #[test]
+    fn delayed_group_clock_lookahead_skips_dormant_content_and_group_cycles() {
+        let mut engine = ShowEngine::from_show_file(
+            ShowFile {
+                cues: vec![
+                    Cue::Group {
+                        base: CueBase {
+                            qid: Decimal::ONE,
+                            parent: Some(Decimal::TWO),
+                            delay: Timespan::from_secs_f64(1.0),
+                            ..Default::default()
+                        },
+                    },
+                    Cue::Group {
+                        base: CueBase {
+                            qid: Decimal::TWO,
+                            parent: Some(Decimal::ONE),
+                            ..Default::default()
+                        },
+                    },
+                    Cue::Image {
+                        base: CueBase {
+                            qid: Decimal::from(3),
+                            parent: Some(Decimal::TWO),
+                            // Groups do not fire AfterLast followers.
+                            trigger: TriggerMode::AfterLast,
+                            ..Default::default()
+                        },
+                        path: "feature.png".into(),
+                        fit: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        engine.command(EngineCommand::Select(Decimal::ONE), Duration::ZERO);
+        engine.command(EngineCommand::Go, Duration::ZERO);
+        assert_eq!(engine.show_elapsed(), None);
+        // Cancel before executing the malformed group; this tests lookahead.
+        engine.command(EngineCommand::Stop, Duration::ZERO);
     }
 
     /// Stopping one cue mid-show is surgical (cut a music bed, kill the

@@ -116,10 +116,21 @@ press only — the release value of 0 is ignored.
 
 The transport bar shows the **show clock** — the clock
 [timecode triggers](#per-cue-triggers) fire against — as `HH:MM:SS.ff`
-(green = running, yellow = paused, `--:--:--.--` before the first GO).
+(green = running, yellow = paused, `--:--:--.--` while stopped).
 The frame part is display-only; set its rate under **Settings → Timecode**
 (triggers are stored in seconds). Next to it, the next armed trigger is
 shown as `next: Q12 @ 00:03:15.00`.
+
+GO starts a stopped clock at zero when it reaches a Sound, Video, Image,
+Text, PixelMap, DMX Show, or TimeCode cue. The clock includes the cue's
+Delay. Groups take their clock behavior from the members they trigger.
+Network, Lighting, Volume, Goto, Dummy, and targeted Stop cues leave the
+clock as they found it, so a control-only pre-show chain keeps it stopped.
+Use a TimeCode cue to start a show made only of control cues.
+
+**Stop All resets the clock.** A RESET followed by playback in the same GO
+starts it again at zero; a terminal Stop All leaves it stopped. Firing a cue
+directly through a per-cue trigger does not start the clock.
 
 **Pause freezes the show clock** and no timecode triggers fire while
 paused. While paused, **⏭ / ⏮ frame-step** move the current video one frame
@@ -139,8 +150,8 @@ to the GO chain:
 - **MIDI** — Note On / Note Off / CC on a channel, with a minimum velocity.
 - **Wall clock** — a time of day (12/24-hour), once or daily. Useful for
   house music, pre-show loops, and installations.
-- **Timecode** — a time on the show clock, which is started by a
-  [TimeCode cue](cues.md#timecode). Entered as `HH:MM:SS.FF` (matching the
+- **Timecode** — a time on the [show clock](#show-clock--timecode).
+  Entered as `HH:MM:SS.FF` (matching the
   show clock display; a bare number is plain seconds). A capture button
   stamps the trigger with the current show time.
 
