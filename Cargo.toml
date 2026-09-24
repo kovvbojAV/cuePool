@@ -83,6 +83,14 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# Windows CI still builds and checks the shipped executable with `release`.
+# Test binaries keep release optimization and assertion settings, without
+# whole-program LTO on each test executable. Tests already require unwinding.
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # wgpu-30 fork carrying only the frame-pacing-diag feature (branch
 # cuepool/frame-pacing-diag-30). The v29-era interop patches are gone: wgpu 30
 # provides the DX12 resource import and fence staging natively, and the #139

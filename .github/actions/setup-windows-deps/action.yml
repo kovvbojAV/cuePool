@@ -1,5 +1,13 @@
 name: Set up Windows dependencies
 description: Install the FFmpeg/ASIO SDKs and static pthreads used by CuePool builds and tests.
+inputs:
+  save-cache:
+    description: Save Rust build outputs after a successful job.
+    default: 'true'
+outputs:
+  cache-hit:
+    description: Whether the Rust cache matched exactly.
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
 runs:
   using: composite
   steps:
@@ -19,10 +27,6 @@ runs:
         "FFMPEG_DIR=$($dir.FullName)" >> $env:GITHUB_ENV
         "$($dir.FullName)\bin" >> $env:GITHUB_PATH
 
-        # Both bindgen output and the C++ D3D12 layout guard depend on this SDK.
-        cargo clean --package ffmpeg-sys-next --package cuepool-video --release
-        if ($LASTEXITCODE -ne 0) { throw "Could not clear cached FFmpeg build outputs" }
-
     - name: Install pinned ASIO SDK
       shell: pwsh
       run: |
@@ -40,11 +44,6 @@ runs:
         }
         "CPAL_ASIO_DIR=$dir" >> $env:GITHUB_ENV
 
-        # asio-sys reuses existing generated bindings/libasio.a even when the
-        # SDK path changes. Cached outputs must not bypass the pinned SDK.
-        cargo clean --package asio-sys --release
-        if ($LASTEXITCODE -ne 0) { throw "Could not clear cached ASIO build outputs" }
-
     - name: Install pthreads for AprilTag
       shell: pwsh
       run: |
@@ -61,3 +60,21 @@ runs:
         "APRILTAG_SYS_METHOD=raw,static" >> $env:GITHUB_ENV
         "APRILTAG_SYS_WINDOWS_PTHREAD_INCLUDE_DIR=$include" >> $env:GITHUB_ENV
         "APRILTAG_SYS_WINDOWS_PTHREAD_STATIC_LIB=$library" >> $env:GITHUB_ENV
+
+    - name: Identify native toolchain image
+      id: native-image
+      shell: pwsh
+      run: |
+        if (!$env:ImageVersion) { throw 'The Windows SDK cache requires a hosted runner image version' }
+        "version=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+
+    # Native bindings do not reliably rebuild when SDK contents change. Keep
+    # SDK/setup/image identity in `key`, which rust-cache retains in ALL restore
+    # prefixes, including Cargo.lock fallbacks. Restore only after SDK paths
+    # are configured, so the environment hash also covers native inputs.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      id: rust-cache
+      with:
+        key: windows-sdk-v1-${{ hashFiles('packaging/windows-dependencies.json', '.github/actions/setup-windows-deps/action.yml') }}-${{ steps.native-image.outputs.version }}
+        env-vars: CARGO CC CFLAGS CXX CMAKE RUST FFMPEG_DIR CPAL_ASIO_DIR APRILTAG_SYS VCPKG_INSTALLATION_ROOT
+        save-if: ${{ inputs.save-cache }}

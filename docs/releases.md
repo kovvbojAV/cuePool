@@ -258,9 +258,19 @@ do not remove Windows from the release gate.
 
 Windows builds use the BtbN FFmpeg 8.0-branch shared SDK pinned in
 `packaging/windows-dependencies.json`. Keep headers and DLLs together: CuePool's
-D3D12VA layout guard relies on this ABI. The dependency setup clears cached
-FFmpeg bindings and the video crate's C++ layout probe when restoring Cargo
-builds. Packaging checks all seven DLL hashes against the pin.
+D3D12VA layout guard relies on this ABI. The dependency setup verifies the SDK
+archives before restoring Cargo builds. Its cache key includes the dependency
+manifest, setup action, hosted Windows image and SDK paths, so even fallback
+restores cannot reuse native bindings from a different SDK or toolchain image.
+Keep Windows Rust caching inside that action: ASIO can reuse stale generated
+files even when its build script reruns. Packaging checks all seven DLL hashes
+against the pin.
+
+Windows CI builds and checks the executable with the shipping `release` profile.
+Its media and AprilTag tests use `ci-test`, which inherits release settings but
+omits whole-program LTO and allows parallel code generation to reduce test compilation time.
+These tests retain optimization level 3 and the release assertion settings;
+the executable build and package validation still exercise full release LTO.
 
 `cuepool-windows-sources.zip` is required for publication alongside the MSI,
 portable ZIP and macOS DMG. The workflow creates it from the exact CuePool
