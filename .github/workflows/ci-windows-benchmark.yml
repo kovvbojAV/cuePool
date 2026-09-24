@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, candidate]
+        variant: [baseline, cache-only, candidate]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,9 +25,22 @@ jobs:
       - name: Record source
         shell: pwsh
         run: |
-          git rev-parse HEAD
-          Write-Host "ImageVersion: $env:ImageVersion"
-          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $metadata = [ordered]@{
+            source = (git rev-parse HEAD).Trim()
+            image_version = $env:ImageVersion
+            cpu_name = $cpu.Name.Trim()
+            cores = $cpu.NumberOfCores
+            logical_processors = $cpu.NumberOfLogicalProcessors
+          }
+          $metadata | ConvertTo-Json | Set-Content seed-metadata.json
+          $metadata | ConvertTo-Json | Write-Host
+      - name: Upload cold seed runner metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: seed-metadata-${{ matrix.variant }}
+          path: seed-metadata.json
+          overwrite: true
       - name: Test Windows packaging tools
         shell: pwsh
         run: .github/scripts/test-windows-packaging-tools.ps1
@@ -42,7 +55,7 @@ jobs:
         id: rust_cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
+          prefix-key: benchmark-${{ github.run_id }}-${{ matrix.variant }}
           shared-key: windows-ci
       - name: Assert cold cache
         if: matrix.variant == 'baseline'
@@ -52,8 +65,8 @@ jobs:
         run: |
           Write-Host "Rust cache exact hit: $env:CACHE_HIT"
           if ($env:CACHE_HIT -eq 'true') { throw 'Cold seed unexpectedly restored an exact cache' }
-      - name: Isolate candidate Rust cache
-        if: matrix.variant == 'candidate'
+      - name: Isolate SDK-aware Rust cache
+        if: matrix.variant != 'baseline'
         shell: pwsh
         run: |
           $path = '.github/actions/setup-windows-deps/action.yml'
@@ -64,7 +77,7 @@ jobs:
           }
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
-              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        prefix-key: benchmark-${{ github.run_id }}-${{ matrix.variant }}'
               '        add-job-id-key: "false"'
             }
             $_
@@ -72,14 +85,14 @@ jobs:
       - name: Install Windows dependencies (baseline)
         if: matrix.variant == 'baseline'
         uses: ./.github/actions/setup-windows-deps
-      - name: Install Windows dependencies (candidate)
-        if: matrix.variant == 'candidate'
+      - name: Install Windows dependencies (optimized)
+        if: matrix.variant != 'baseline'
         id: windows_deps
         uses: ./.github/actions/setup-windows-deps
         with:
           save-cache: 'true'
-      - name: Assert cold candidate cache
-        if: matrix.variant == 'candidate'
+      - name: Assert cold optimized cache
+        if: matrix.variant != 'baseline'
         shell: pwsh
         env:
           CACHE_HIT: ${{ steps.windows_deps.outputs.cache-hit }}
@@ -101,6 +114,7 @@ jobs:
           name: installer-mechanics-${{ matrix.variant }}-cold
           path: installer-mechanics-validation/
           if-no-files-found: ignore
+          overwrite: true
       - name: Upload Cargo timing reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -108,12 +122,25 @@ jobs:
           name: cargo-timings-${{ matrix.variant }}-cold
           path: target/cargo-timings/
           if-no-files-found: ignore
+          overwrite: true
 
   cache-invalidation:
     name: Candidate SDK cache invalidation
     needs: cold
     runs-on: windows-latest
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: seed-metadata-candidate
+          path: seed-metadata
+      - name: Match candidate cold seed image
+        shell: pwsh
+        run: |
+          $seed = Get-Content seed-metadata/seed-metadata.json -Raw | ConvertFrom-Json
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "Seed image: $($seed.image_version); runner image: $env:ImageVersion"
+          Write-Host "Seed CPU: $($seed.cpu_name) ($($seed.logical_processors) logical); runner CPU: $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) logical)"
+          if ($env:ImageVersion -ne $seed.image_version) { throw 'Runner image differs from candidate cold seed; retry this job' }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
         with:
@@ -129,7 +156,7 @@ jobs:
           }
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
-              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        prefix-key: benchmark-${{ github.run_id }}-candidate'
               '        add-job-id-key: "false"'
             }
             $_
@@ -173,9 +200,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, candidate]
+        variant: [baseline, cache-only, candidate]
         sample: [1, 2]
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: seed-metadata-${{ matrix.variant }}
+          path: seed-metadata
+      - name: Match cold seed image
+        shell: pwsh
+        run: |
+          $seed = Get-Content seed-metadata/seed-metadata.json -Raw | ConvertFrom-Json
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          Write-Host "Seed image: $($seed.image_version); runner image: $env:ImageVersion"
+          Write-Host "Seed CPU: $($seed.cpu_name) ($($seed.logical_processors) logical); runner CPU: $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) logical)"
+          if ($env:ImageVersion -ne $seed.image_version) { throw 'Runner image differs from cold seed; retry this job' }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.variant == 'baseline' && '9b013aa571bf79db88889815cd6c0c83f8865f84' || github.sha }}
@@ -199,7 +238,7 @@ jobs:
         id: rust_cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}
+          prefix-key: benchmark-${{ github.run_id }}-${{ matrix.variant }}
           shared-key: windows-ci
           save-if: 'false'
       - name: Assert warm cache
@@ -210,8 +249,8 @@ jobs:
         run: |
           Write-Host "Rust cache exact hit: $env:CACHE_HIT"
           if ($env:CACHE_HIT -ne 'true') { throw 'Warm sample did not restore the seed cache' }
-      - name: Isolate candidate Rust cache
-        if: matrix.variant == 'candidate'
+      - name: Isolate SDK-aware Rust cache
+        if: matrix.variant != 'baseline'
         shell: pwsh
         run: |
           $path = '.github/actions/setup-windows-deps/action.yml'
@@ -222,7 +261,7 @@ jobs:
           }
           $lines | ForEach-Object {
             if ($_.StartsWith($needle)) {
-              '        prefix-key: benchmark-${{ github.run_id }}-${{ github.run_attempt }}-candidate'
+              '        prefix-key: benchmark-${{ github.run_id }}-${{ matrix.variant }}'
               '        add-job-id-key: "false"'
             }
             $_
@@ -230,14 +269,14 @@ jobs:
       - name: Install Windows dependencies (baseline)
         if: matrix.variant == 'baseline'
         uses: ./.github/actions/setup-windows-deps
-      - name: Install Windows dependencies (candidate)
-        if: matrix.variant == 'candidate'
+      - name: Install Windows dependencies (optimized)
+        if: matrix.variant != 'baseline'
         id: windows_deps
         uses: ./.github/actions/setup-windows-deps
         with:
           save-cache: 'false'
-      - name: Assert warm candidate cache
-        if: matrix.variant == 'candidate'
+      - name: Assert warm optimized cache
+        if: matrix.variant != 'baseline'
         shell: pwsh
         env:
           CACHE_HIT: ${{ steps.windows_deps.outputs.cache-hit }}
@@ -259,6 +298,7 @@ jobs:
           name: installer-mechanics-${{ matrix.variant }}-warm-${{ matrix.sample }}
           path: installer-mechanics-validation/
           if-no-files-found: ignore
+          overwrite: true
       - name: Upload Cargo timing reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -266,3 +306,4 @@ jobs:
           name: cargo-timings-${{ matrix.variant }}-warm-${{ matrix.sample }}
           path: target/cargo-timings/
           if-no-files-found: ignore
+          overwrite: true
