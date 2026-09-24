@@ -5,6 +5,12 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ## [Unreleased]
 
+## [0.13.5](https://github.com/kovvbojAV/cuePool/compare/v0.13.4...v0.13.5) - 2026-09-24
+
+### Application fixes
+
+- *(cuepool)* keep cue list columns aligned regardless of cell content ([#52](https://github.com/kovvbojAV/cuePool/pull/52))
+
 ## [0.13.4](https://github.com/kovvbojAV/cuePool/compare/v0.13.3...v0.13.4) - 2026-09-24
 
 ### Application fixes
