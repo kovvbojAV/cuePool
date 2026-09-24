@@ -24,7 +24,10 @@ jobs:
           ref: ${{ matrix.variant == 'baseline' && '9b013aa571bf79db88889815cd6c0c83f8865f84' || github.sha }}
       - name: Record source
         shell: pwsh
-        run: git rev-parse HEAD
+        run: |
+          git rev-parse HEAD
+          Write-Host "ImageVersion: $env:ImageVersion"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
       - name: Test Windows packaging tools
         shell: pwsh
         run: .github/scripts/test-windows-packaging-tools.ps1
@@ -178,7 +181,10 @@ jobs:
           ref: ${{ matrix.variant == 'baseline' && '9b013aa571bf79db88889815cd6c0c83f8865f84' || github.sha }}
       - name: Record source
         shell: pwsh
-        run: git rev-parse HEAD
+        run: |
+          git rev-parse HEAD
+          Write-Host "ImageVersion: $env:ImageVersion"
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
       - name: Test Windows packaging tools
         shell: pwsh
         run: .github/scripts/test-windows-packaging-tools.ps1
