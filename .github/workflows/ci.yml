@@ -97,9 +97,9 @@ jobs:
       - name: Verify desktop subsystem and command-line output
         run: .github/scripts/test-windows-cli.ps1 -Exe target/release/cuepool.exe -UseBuildEnvironment
       - name: Verify media decoding with the packaged Windows SDK
-        run: cargo test --profile ci-test --locked -p cuepool-harness --test headless_show --features cuepool/asio
+        run: cargo test --release --locked -p cuepool-harness --test headless_show --features cuepool/asio
       - name: Test AprilTag calibration
-        run: cargo test --profile ci-test --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame -- --exact
+        run: cargo test --release --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame -- --exact
 
   cuepool-mcp:
     name: CuePool MCP (Node 20)

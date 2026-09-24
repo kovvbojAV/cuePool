@@ -266,12 +266,6 @@ Keep Windows Rust caching inside that action: ASIO can reuse stale generated
 files even when its build script reruns. Packaging checks all seven DLL hashes
 against the pin.
 
-Windows CI builds and checks the executable with the shipping `release` profile.
-Its media and AprilTag tests use `ci-test`, which inherits release settings but
-omits whole-program LTO and allows parallel code generation to reduce test compilation time.
-These tests retain optimization level 3 and the release assertion settings;
-the executable build and package validation still exercise full release LTO.
-
 `cuepool-windows-sources.zip` is required for publication alongside the MSI,
 portable ZIP and macOS DMG. The workflow creates it from the exact CuePool
 checkout, verified upstream FFmpeg/ASIO archives, the matching BtbN build-script
