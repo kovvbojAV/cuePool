@@ -54,16 +54,18 @@ beam (zoom / strobe / gobo) values — for any subset of the patch, and
 crossfades the rig to it over *Fade (s)* with a selectable
 [curve](cues.md#fade-curves).
 
-Fixtures **not** included in a cue keep whatever state the previous cue left
-them in (LTP tracking): build your show as a sequence of partial looks, and
-only the fixtures you touch change.
+Fixtures **not** included in a cue continue their existing fades or hold
+their completed looks (LTP tracking). Fades from different cues can run
+together, each with its own fade time and curve. A new cue takes over only
+the fixtures it includes, starting from their current mid-fade looks.
 
 ### Live programming
 
 Tick **🔴 Live** at the top of a Lighting cue's inspector to stream every
 look edit straight to the fixtures while you program — what you see on
 stage is what the cue will play. The toggle is session-only (not saved) and
-follows LTP: fixtures not included in the cue hold their current levels.
+follows LTP: fixtures not included in the cue continue their existing
+fades or hold their completed looks.
 
 ## DMX Show cues
 

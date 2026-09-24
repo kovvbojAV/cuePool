@@ -1,12 +1,11 @@
 //! Lighting cue playback — crossfades fixture looks, plays recorded DMX
 //! shows, and streams the merged result.
 //!
-//! One theatrical crossfader: `go()` captures the *current* live state
-//! (mid-fade included) as the fade source and the cue snapshot merged over it
-//! as the target. Fixtures absent from a cue's snapshot track their current
-//! state (LTP). Recorded `.dmxrec` shows ([`ShowPlayer`]) run alongside as
-//! separate merge layers; per tick every layer is composited sACN-style
-//! (highest priority wins per owned channel, weight = fade envelope). A paced
+//! Each fixture fades independently: `go()` starts from its *current* look
+//! (mid-fade included). Fixtures absent from a cue's snapshot keep their
+//! existing fade or held look (LTP). Recorded `.dmxrec` shows ([`ShowPlayer`])
+//! run alongside as separate merge layers; per tick every layer is composited
+//! sACN-style (highest priority wins per owned channel, weight = fade envelope). A paced
 //! [`DmxSender`] thread handles wire pacing/keep-alive; this engine only
 //! submits frames when something changed.
 
@@ -27,8 +26,8 @@ struct ActiveFade {
     start: Instant,
     duration: f32,
     fade_type: FadeType,
-    from: BTreeMap<FixtureId, FixtureLook>,
-    to: BTreeMap<FixtureId, FixtureLook>,
+    from: FixtureLook,
+    to: FixtureLook,
 }
 
 /// A playing recorded DMX show (one `DmxShowCue`).
@@ -132,7 +131,7 @@ pub struct LightingEngine {
     /// (protocol, sorted dest set, fps bits) the senders were built from.
     applied: Option<(LightingProtocol, Vec<String>, u32)>,
     live: BTreeMap<FixtureId, FixtureLook>,
-    fade: Option<ActiveFade>,
+    fades: BTreeMap<FixtureId, ActiveFade>,
     /// Playing recorded shows, in start order (composite tie-break).
     shows: Vec<ActiveShow>,
     /// Held overlay layer (recorder monitor / live input bridge): the owner
@@ -159,7 +158,7 @@ fn curve(t: f32, fade_type: FadeType) -> f32 {
 
 impl LightingEngine {
     pub fn is_active(&self) -> bool {
-        self.fade.is_some() || !self.shows.is_empty() || self.overlay.is_some()
+        !self.fades.is_empty() || !self.shows.is_empty() || self.overlay.is_some()
     }
 
     pub fn active_show_qids(&self) -> impl Iterator<Item = Decimal> + '_ {
@@ -173,22 +172,33 @@ impl LightingEngine {
         fade_time: f32,
         fade_type: FadeType,
     ) {
-        let from = self.evaluate(Instant::now());
-        let mut to = from.clone();
+        self.go_at(snapshot, fade_time, fade_type, Instant::now());
+    }
+
+    fn go_at(
+        &mut self,
+        snapshot: &BTreeMap<FixtureId, FixtureLook>,
+        fade_time: f32,
+        fade_type: FadeType,
+        now: Instant,
+    ) {
+        let from = self.evaluate(now);
         for (id, look) in snapshot {
-            to.insert(*id, *look);
-        }
-        if fade_time > 0.0 {
-            self.fade = Some(ActiveFade {
-                start: Instant::now(),
-                duration: fade_time,
-                fade_type,
-                from,
-                to,
-            });
-        } else {
-            self.live = to;
-            self.fade = None;
+            if fade_time > 0.0 {
+                self.fades.insert(
+                    *id,
+                    ActiveFade {
+                        start: now,
+                        duration: fade_time,
+                        fade_type,
+                        from: from.get(id).copied().unwrap_or_default(),
+                        to: *look,
+                    },
+                );
+            } else {
+                self.live.insert(*id, *look);
+                self.fades.remove(id);
+            }
         }
         self.dirty = true;
     }
@@ -276,34 +286,33 @@ impl LightingEngine {
         self.dirty = true;
     }
 
-    /// Cancel an in-flight fade, holding the current mid-fade state.
+    /// Cancel all fixture fades, holding their current mid-fade looks.
     pub fn stop_fade(&mut self) {
-        if self.fade.is_some() {
-            self.live = self.evaluate(Instant::now());
-            self.fade = None;
+        self.stop_fade_at(Instant::now());
+    }
+
+    fn stop_fade_at(&mut self, now: Instant) {
+        if !self.fades.is_empty() {
+            self.evaluate(now);
+            self.fades.clear();
             self.dirty = true;
         }
     }
 
-    /// Current looks at `now` — mid-fade values while a fade is running.
-    fn evaluate(&self, now: Instant) -> BTreeMap<FixtureId, FixtureLook> {
-        match &self.fade {
-            None => self.live.clone(),
-            Some(f) => {
-                let t = if f.duration > 0.0 {
-                    (now.duration_since(f.start).as_secs_f32() / f.duration).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                let t = curve(t, f.fade_type);
-                f.to.iter()
-                    .map(|(id, target)| {
-                        let start = f.from.get(id).copied().unwrap_or_default();
-                        (*id, start.lerp(target, t))
-                    })
-                    .collect()
-            }
-        }
+    /// Sample current looks into live state, retiring each completed fade.
+    fn evaluate(&mut self, now: Instant) -> BTreeMap<FixtureId, FixtureLook> {
+        self.fades.retain(|id, f| {
+            let elapsed = now.duration_since(f.start).as_secs_f32();
+            let complete = elapsed >= f.duration;
+            let look = if complete {
+                f.to
+            } else {
+                f.from.lerp(&f.to, curve(elapsed / f.duration, f.fade_type))
+            };
+            self.live.insert(*id, look);
+            !complete
+        });
+        self.live.clone()
     }
 
     /// Periodic tick from the main loop: manages the sender lifecycle, advances
@@ -323,19 +332,12 @@ impl LightingEngine {
             return;
         }
 
-        let animating = self.fade.is_some() || !self.shows.is_empty();
+        let animating = !self.fades.is_empty() || !self.shows.is_empty();
         if !animating && !self.dirty {
             return; // DmxSender keep-alive re-sends the latest frame.
         }
 
         let looks = self.evaluate(now);
-        // Fade complete → collapse into live state.
-        if let Some(f) = &self.fade
-            && now.duration_since(f.start).as_secs_f32() >= f.duration
-        {
-            self.live = f.to.clone();
-            self.fade = None;
-        }
 
         // Look layer, one masked frame per destination — fixtures render into
         // their node's frame and own exactly the channels they write.
@@ -483,7 +485,7 @@ impl LightingEngine {
         }
         self.applied = None;
         self.live.clear();
-        self.fade = None;
+        self.fades.clear();
         self.shows.clear();
         self.finished_shows.clear();
         self.overlay = None;
@@ -495,12 +497,267 @@ impl LightingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn look(dimmer: f32) -> FixtureLook {
         FixtureLook {
             dimmer,
             ..Default::default()
         }
+    }
+
+    fn assert_dimmers(eng: &mut LightingEngine, now: Instant, expected: &[(FixtureId, f32)]) {
+        let state = eng.evaluate(now);
+        for (id, expected) in expected {
+            let actual = state.get(id).expect("fixture has a look").dimmer;
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "fixture {id}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_cue_leaves_earlier_fade_running() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.go_at(
+            &BTreeMap::from([(4, look(1.0))]),
+            30.0,
+            FadeType::Linear,
+            start,
+        );
+        // #43: the deck is 52/255 when the movers cue starts 6.19s later.
+        let movers_start = start + Duration::from_millis(6190);
+        let profile = LightingConfig::default().profile("dimmer").unwrap();
+        assert_eq!(
+            render_look(&profile, &eng.evaluate(movers_start)[&4]),
+            vec![52]
+        );
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0)), (2, look(0.5)), (3, look(0.25))]),
+            30.0,
+            FadeType::Linear,
+            movers_start,
+        );
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(15),
+            &[(4, 0.5), (1, 8.81 / 30.0)],
+        );
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(30),
+            &[(4, 1.0), (1, 23.81 / 30.0)],
+        );
+        assert_eq!(
+            render_look(&profile, &eng.evaluate(start + Duration::from_secs(30))[&4]),
+            vec![255],
+        );
+        assert_dimmers(
+            &mut eng,
+            movers_start + Duration::from_secs(30),
+            &[(4, 1.0), (1, 1.0), (2, 0.5), (3, 0.25)],
+        );
+    }
+
+    #[test]
+    fn simultaneous_cues_both_fade() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        eng.go_at(
+            &BTreeMap::from([(2, look(0.5))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        assert_dimmers(&mut eng, start, &[(1, 0.0), (2, 0.0)]);
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(5),
+            &[(1, 0.5), (2, 0.25)],
+        );
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(10),
+            &[(1, 1.0), (2, 0.5)],
+        );
+    }
+
+    #[test]
+    fn live_push_replaces_only_addressed_fixtures() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0)), (2, look(1.0))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        // The inspector sends a zero-time go for its edited snapshot.
+        eng.go_at(
+            &BTreeMap::from([(2, look(0.25)), (3, look(0.75))]),
+            0.0,
+            FadeType::Linear,
+            start + Duration::from_secs(2),
+        );
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(2),
+            &[(1, 0.2), (2, 0.25), (3, 0.75)],
+        );
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(10),
+            &[(1, 1.0), (2, 0.25), (3, 0.75)],
+        );
+    }
+
+    #[test]
+    fn same_fixture_takeover_starts_at_current_look() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        let takeover = start + Duration::from_secs(4);
+        // No tick between the two cues: go must sample the old fade itself.
+        eng.go_at(
+            &BTreeMap::from([(1, look(0.0))]),
+            6.0,
+            FadeType::Linear,
+            takeover,
+        );
+        assert_dimmers(&mut eng, takeover, &[(1, 0.4)]);
+        assert_dimmers(&mut eng, takeover + Duration::from_secs(3), &[(1, 0.2)]);
+        assert_dimmers(&mut eng, takeover + Duration::from_secs(6), &[(1, 0.0)]);
+    }
+
+    #[test]
+    fn fixture_curves_and_completion_are_independent() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        let moving = FixtureLook {
+            dimmer: 1.0,
+            color: [1.0, 0.5, 0.25],
+            pan: 1.0,
+            tilt: 0.0,
+            strobe: 1.0,
+            gobo: 42,
+            ..Default::default()
+        };
+        for (id, duration, curve, target) in [
+            (1, 4.0, FadeType::Linear, look(1.0)),
+            (2, 8.0, FadeType::Square, moving),
+            (3, 16.0, FadeType::InverseSquare, look(1.0)),
+            (4, 16.0, FadeType::SCurve, look(1.0)),
+        ] {
+            eng.go_at(&BTreeMap::from([(id, target)]), duration, curve, start);
+        }
+        assert!(eng.is_active());
+        let halfway = start + Duration::from_secs(4);
+        assert_dimmers(
+            &mut eng,
+            halfway,
+            &[(1, 1.0), (2, 0.25), (3, 0.5), (4, 0.15625)],
+        );
+        assert!(
+            !eng.fades.contains_key(&1),
+            "completed fixture holds its target"
+        );
+        assert!(eng.is_active(), "other fixtures are still fading");
+        assert_eq!(
+            eng.evaluate(halfway)[&2],
+            FixtureLook {
+                dimmer: 0.25,
+                color: [0.25, 0.125, 0.0625],
+                pan: 0.625,
+                tilt: 0.375,
+                ..Default::default()
+            },
+            "continuous parameters fade; strobe and gobo wait until the end",
+        );
+        assert_eq!(eng.evaluate(start + Duration::from_secs(8))[&2], moving);
+        assert!(eng.is_active());
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(16),
+            &[(1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0)],
+        );
+        assert!(!eng.is_active(), "the last fade has finished");
+        assert_eq!(eng.evaluate(start + Duration::from_secs(30))[&2], moving);
+    }
+
+    #[test]
+    fn empty_snapshot_leaves_fades_running() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        for fade_time in [0.0, 5.0] {
+            eng.go_at(
+                &BTreeMap::new(),
+                fade_time,
+                FadeType::Square,
+                start + Duration::from_secs(2),
+            );
+        }
+        assert!(eng.is_active());
+        assert_dimmers(&mut eng, start + Duration::from_secs(10), &[(1, 1.0)]);
+        assert!(!eng.is_active());
+    }
+
+    #[test]
+    fn stop_holds_all_fixtures_without_stopping_shows_or_overlay() {
+        let mut eng = LightingEngine::default();
+        let start = Instant::now();
+        eng.shows.push(show(LoopMode::LoopedInfinite, 0.0, 0));
+        eng.set_overlay(Some((150, MaskedFrame::default())));
+        eng.go_at(
+            &BTreeMap::from([(1, look(1.0))]),
+            10.0,
+            FadeType::Linear,
+            start,
+        );
+        eng.go_at(
+            &BTreeMap::from([(2, look(0.8))]),
+            20.0,
+            FadeType::Linear,
+            start + Duration::from_secs(2),
+        );
+        eng.dirty = false;
+        eng.stop_fade_at(start + Duration::from_secs(5));
+        assert!(eng.dirty, "the held looks must be submitted");
+        assert!(eng.fades.is_empty());
+        assert_dimmers(
+            &mut eng,
+            start + Duration::from_secs(30),
+            &[(1, 0.5), (2, 0.12)],
+        );
+        assert_eq!(
+            eng.active_show_qids().collect::<Vec<_>>(),
+            vec![Decimal::ONE]
+        );
+        assert!(eng.shows[0].stopping.is_none());
+        assert!(eng.take_finished_shows().is_empty());
+        assert!(eng.is_active(), "recorded show and overlay remain active");
+        eng.stop_all_shows();
+        assert!(eng.is_active(), "overlay alone remains active");
+        eng.set_overlay(None);
+        assert!(!eng.is_active());
     }
 
     fn show(loop_mode: LoopMode, fade_out: f32, age_ms: u64) -> ActiveShow {
@@ -695,6 +952,6 @@ mod tests {
         eng.stop_fade();
         let held = eng.evaluate(Instant::now()).get(&1).unwrap().dimmer;
         assert!(held > 0.95, "held near start value, got {held}");
-        assert!(eng.fade.is_none());
+        assert!(eng.fades.is_empty());
     }
 }
