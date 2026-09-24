@@ -5,6 +5,13 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/kovvbojAV/cuePool/compare/v0.13.3...v0.13.4) - 2026-09-24
+
+### Application fixes
+
+- keep control-only GO chains from starting the show clock ([#48](https://github.com/kovvbojAV/cuePool/pull/48))
+- preserve independent fixture fades ([#47](https://github.com/kovvbojAV/cuePool/pull/47))
+
 ## [0.13.3](https://github.com/kovvbojAV/cuePool/compare/v0.13.2...v0.13.3) - 2026-09-24
 
 ### Application fixes
