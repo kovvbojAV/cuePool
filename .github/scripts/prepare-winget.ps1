@@ -64,15 +64,15 @@ try {
     if (Test-Path $directory) { throw "Refusing to overwrite existing manifests: $directory" }
     New-Item -ItemType Directory -Force $directory | Out-Null
     @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.28.0.schema.json
 PackageIdentifier: $id
 PackageVersion: $Version
 DefaultLocale: en-US
 ManifestType: version
-ManifestVersion: 1.12.0
+ManifestVersion: 1.28.0
 "@ | Set-Content (Join-Path $directory "$id.yaml") -Encoding utf8
     @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 PackageIdentifier: $id
 PackageVersion: $Version
 PackageLocale: en-US
@@ -86,10 +86,10 @@ LicenseUrl: https://www.gnu.org/licenses/gpl-3.0.html
 ShortDescription: Audio, video and lighting cue playback for live shows and installations.
 ReleaseNotesUrl: $repository/releases/tag/v$Version
 ManifestType: defaultLocale
-ManifestVersion: 1.12.0
+ManifestVersion: 1.28.0
 "@ | Set-Content (Join-Path $directory "$id.locale.en-US.yaml") -Encoding utf8
     @"
-# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
 PackageIdentifier: $id
 PackageVersion: $Version
 InstallerType: wix
@@ -108,7 +108,7 @@ Installers:
     ProductCode: '$productCode'
     UpgradeCode: '$upgradeCode'
 ManifestType: installer
-ManifestVersion: 1.12.0
+ManifestVersion: 1.28.0
 "@ | Set-Content (Join-Path $directory "$id.installer.yaml") -Encoding utf8
     Write-Output "Prepared manifests from public MSI $hash at $directory"
 } finally {
