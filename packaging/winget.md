@@ -46,7 +46,7 @@ it with the public download before submission.
 For the first submission, run **Validate WinGet submission** in GitHub Actions
 with a published version whose MSI Manufacturer is `kovvbojAV`. This workflow
 downloads the public MSI and checksum manifest, verifies its actual product identity, creates
-the three schema-1.12 manifests, and tests validation, installation and removal
+the three schema-1.28 manifests, and tests validation, installation and removal
 through WinGet on a disposable Windows runner. Use the manifest files from its
 `cuepool-winget-submission` artifact only after the job succeeds; the workflow
 does not submit a PR. It also retains the WinGet diagnostic logs.
@@ -79,7 +79,7 @@ Remove the pin only for a scheduled, validated upgrade. WinGet does not replace
 show acceptance or project/settings backups.
 
 References: [manifest authoring](https://learn.microsoft.com/en-us/windows/package-manager/package/manifest),
-[installer schema](https://github.com/microsoft/winget-pkgs/blob/master/doc/manifest/schema/1.12.0/installer.md),
+[installer schema](https://github.com/microsoft/winget-pkgs/blob/master/doc/manifest/schema/1.28.0/installer.md),
 [manifest submission](https://learn.microsoft.com/en-us/windows/package-manager/package/repository),
 [local manifest validation](https://learn.microsoft.com/en-us/windows/package-manager/winget/validate),
 [version pinning](https://learn.microsoft.com/en-us/windows/package-manager/winget/pinning).
