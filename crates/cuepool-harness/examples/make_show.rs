@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         cues: vec![Cue::Video {
             base,
             // Absolute, so the project can live anywhere.
-            path: video.clone().into(),
+            path: video.clone(),
             start_time: Timespan::ZERO,
             // Zero means "play to the end".
             duration: Timespan::ZERO,
