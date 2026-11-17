@@ -1,0 +1,6 @@
+[env]
+# apriltag-sys bundles C written before C23, where `void (*f)()` means "no
+# arguments". GCC 15 (Ubuntu 26.04, now `ubuntu-latest`) defaults to C23 and
+# rejects it; gnu17 was the default before that.
+CFLAGS_x86_64_unknown_linux_gnu = "-std=gnu17"
+CFLAGS_aarch64_unknown_linux_gnu = "-std=gnu17"
