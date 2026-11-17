@@ -4,10 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.workflow == 'CI' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +22,9 @@ jobs:
     name: CuePool (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       # The FFmpeg -dev packages are most of this job. Fetching them took a
       # median of 379s across the last eleven runs and as much as 1508s, against
       # ~110s for everything cargo does. Keeping the .debs means only the first
@@ -25,7 +32,7 @@ jobs:
       #
       # Bump the key's version suffix when the package list below changes.
       - name: Cache apt packages
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-debs
           key: apt-cuepool-x64-v1
@@ -41,19 +48,58 @@ jobs:
             libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
           # apt runs as root; hand the archive back so the cache can save it.
           sudo chown -R "$USER" ~/apt-debs
-      - uses: dtolnay/rust-toolchain@1.97.1
+      # dtolnay/rust-toolchain publishes per-version refs (like `1.97.1`) only
+      # as branches, which can be force-pushed and orphan their old commits.
+      # Pin to the `master` branch tip (fast-forwarded, so old SHAs stay
+      # reachable) and select the toolchain via `with:` instead.
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: python3 .github/scripts/release.py validate
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - name: Security audit
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  cuepool-windows:
+    name: CuePool (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - name: Test Windows packaging tools
+        shell: pwsh
+        run: .github/scripts/test-windows-packaging-tools.ps1
+      - name: Rehearse MSI mechanics with a synthetic payload
+        shell: pwsh
+        run: .github/scripts/test-windows-installer-mechanics.ps1 -LogDir installer-mechanics-validation
+      - name: Upload synthetic MSI rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: installer-mechanics-validation
+          path: installer-mechanics-validation/
+          if-no-files-found: ignore
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master (toolchain: 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - uses: ./.github/actions/setup-windows-deps
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+      # Match the release build so Windows failures are caught before tagging.
+      - run: cargo build --release --locked -p cuepool --features asio
+      - name: Verify desktop subsystem and command-line output
+        run: .github/scripts/test-windows-cli.ps1 -Exe target/release/cuepool.exe -UseBuildEnvironment
+      - name: Verify media decoding with the packaged Windows SDK
+        run: cargo test --release --locked -p cuepool-harness --test headless_show --features cuepool/asio
+      - name: Test AprilTag calibration
+        run: cargo test --release --locked -p cuepool-video --lib calibration::detect::tests::apriltag_roundtrip_synthetic_frame -- --exact
 
   cuepool-mcp:
     name: CuePool MCP (Node 20)
@@ -62,11 +108,40 @@ jobs:
       run:
         working-directory: mcp
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: mcp/package-lock.json
       - run: npm ci
       - run: npm test
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  release-policy:
+    name: Release policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: release-plz@0.3.169
+      - run: python3 scripts/test-release-policy.py

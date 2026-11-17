@@ -263,6 +263,33 @@ fn mode_button_toggles_show_mode() {
 }
 
 #[test]
+fn master_volume_lives_in_project_settings_and_flags_the_status_bar() {
+    let (mut harness, state) = demo_harness();
+
+    // At unity the main screen says nothing about it.
+    assert!(harness.query_by_label("Master +0.0 dB").is_none());
+
+    state.lock().unwrap().show_settings_window = true;
+    harness.run();
+    assert!(
+        harness.query_by_label("+0.0 dB").is_some(),
+        "fader readout under Project Settings → Audio"
+    );
+
+    // A trim from OSC or a loaded show must be visible without opening a
+    // window, and the readout follows the show setting, not a local copy.
+    state
+        .lock()
+        .unwrap()
+        .show_file
+        .show_settings
+        .master_volume_db = -6.0;
+    harness.run();
+    assert!(harness.query_by_label("Master -6.0 dB").is_some());
+    assert!(harness.query_by_label("-6.0 dB").is_some());
+}
+
+#[test]
 fn go_button_queues_transport_command() {
     let (mut harness, state) = demo_harness();
 
@@ -492,6 +519,96 @@ fn edit_and_show_mode_snapshots() {
     harness.snapshot_options("show_mode", &snapshot_options);
 }
 
+/// The cue list's cells were drawn with `add_sized`, which centres a widget and
+/// lets it extend past the cell when it does not fit. A long name, or the
+/// Trigger combo showing "After last", pushed every later cell on its row to the
+/// right, so Loop and Type started at a different x on those rows.
+#[test]
+fn cue_list_columns_line_up_whatever_the_cells_hold() {
+    const LONG_NAME: &str = "Broadcast PRESHOW_ACTIVE to the lobby, foyer and cloakroom displays";
+    let (mut harness, state) = demo_harness();
+    // The demo group already holds a "With last" and an "After last" member
+    // beside top-level "Go" cues, and three of the show's cues are playing. The
+    // show lacks a name wider than the Name column.
+    state.lock().unwrap().show_file.cues[2].base_mut().name = LONG_NAME.into();
+    harness.run();
+
+    assert_eq!(state.lock().unwrap().show_mode, ShowMode::Edit);
+    assert_cue_list_columns_line_up(&harness, LONG_NAME, "Edit mode");
+    // The Trigger combo used to grow to fit its label, so the column had one
+    // right edge per trigger mode.
+    let combos: Vec<egui::Rect> = harness
+        .query_all(By::new().role(Role::ComboBox))
+        .map(|node| node.rect())
+        .filter(|rect| in_cue_list(*rect))
+        .collect();
+    assert_eq!(combos.len(), 8, "one Trigger combo per cue: {combos:?}");
+    assert!(
+        combos.iter().all(|rect| {
+            (rect.left() - combos[0].left()).abs() < 0.5
+                && (rect.right() - combos[0].right()).abs() < 0.5
+        }),
+        "every Trigger combo should span the same x range whatever its label: {combos:?}"
+    );
+
+    // Show mode marks playing cues in front of their number and draws the
+    // trigger as a label; the columns must hold there too.
+    harness.get_by_label("Edit Mode").click();
+    harness.run();
+    assert_eq!(state.lock().unwrap().show_mode, ShowMode::Show);
+    assert_cue_list_columns_line_up(&harness, LONG_NAME, "Show mode");
+}
+
+/// Every row's Loop and Type cells start at the same x, and `long_name` is cut
+/// to its column rather than running on under the Trigger column.
+fn assert_cue_list_columns_line_up(harness: &Harness<'static>, long_name: &str, mode: &str) {
+    for (column, texts) in [
+        ("Loop", &["1"][..]),
+        (
+            "Type",
+            &["GRP", "SND", "VID", "TXT", "LX", "NET", "VOL", "STP"][..],
+        ),
+    ] {
+        let lefts: Vec<f32> = texts
+            .iter()
+            .flat_map(|text| {
+                harness
+                    .query_all(By::new().role(Role::Label).label(text))
+                    .map(|node| node.rect())
+                    .filter(|rect| in_cue_list(*rect))
+                    .map(|rect| rect.left())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            lefts.iter().all(|left| (left - lefts[0]).abs() < 0.5),
+            "{mode}: every {column} cell should start at the same x, got {lefts:?}"
+        );
+        // A cell pushed far enough right leaves the list altogether.
+        assert_eq!(
+            lefts.len(),
+            8,
+            "{mode}: one {column} cell per cue: {lefts:?}"
+        );
+    }
+
+    let name = harness
+        .query_all(By::new().label(long_name))
+        .map(|node| node.rect())
+        .find(|rect| in_cue_list(*rect))
+        .unwrap_or_else(|| panic!("{mode}: no cue-list row named {long_name:?}"));
+    let trigger_header = harness
+        .query_all(By::new().role(Role::Label).label("Trigger"))
+        .map(|node| node.rect())
+        .find(|rect| in_cue_list(*rect))
+        .unwrap_or_else(|| panic!("{mode}: no Trigger column header"));
+    assert!(
+        name.right() <= trigger_header.left(),
+        "{mode}: the long name should stop at the Name column ({name:?}), \
+         not run under Trigger ({trigger_header:?})"
+    );
+}
+
 /// New / Open confirm in-app. A native modal here deadlocks the winit loop and
 /// can open behind fullscreen output windows, which reads to the operator as
 /// the app soft-locking with no dialog in sight.
@@ -659,8 +776,14 @@ fn name_cell(harness: &Harness<'static>, name: &str) -> egui::Rect {
     harness
         .get_all(By::new().label(name))
         .map(|node| node.rect())
-        .find(|rect| rect.left() > 240.0 && rect.right() < 870.0)
+        .find(|rect| in_cue_list(*rect))
         .unwrap_or_else(|| panic!("no cue-list row named {name:?}"))
+}
+
+/// Whether `rect` sits in the central column, where the cue list is drawn,
+/// rather than in the Active Cues panel or the inspector.
+fn in_cue_list(rect: egui::Rect) -> bool {
+    rect.left() > 240.0 && rect.right() < 870.0
 }
 
 /// Select a cue by clicking its row. One click selects and no longer opens an
@@ -1500,4 +1623,21 @@ fn enter_opens_the_selected_cue_for_renaming() {
         state.lock().unwrap().selected_cue_id,
         Some(Decimal::new(12, 1))
     );
+}
+
+#[test]
+fn changes_view_shows_shared_identity_and_offline_baseline() {
+    let (mut harness, state) = demo_harness();
+    state.lock().unwrap().show_changes_window = true;
+    harness.run();
+    assert!(harness.query_by_label(&build_identity()).is_some());
+    assert!(
+        harness
+            .query_by_label(&format!(
+                "Comparison baseline: {}",
+                cuepool_core::build_identity::BUILD.changes_baseline
+            ))
+            .is_some()
+    );
+    assert!(harness.query_by_label("Publication status is the recorded status at build time; a version tag alone is not a published release.").is_some());
 }

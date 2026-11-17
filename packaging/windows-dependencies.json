@@ -1,0 +1,31 @@
+{
+  "ffmpeg": {
+    "version": "n8.0.1-66-g27b8d1a017",
+    "binary": {
+      "url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-02-28-12-59/ffmpeg-n8.0.1-66-g27b8d1a017-win64-gpl-shared-8.0.zip",
+      "sha256": "8b90cd275b3502ba0e16ef00f3bf1844130a8340ea63831eab3398d1907b38d1"
+    },
+    "dll_sha256": {
+      "avcodec-62.dll": "857d3c12fe6def50570dc51360c8661ab1410955ed22714019969913c67a28dc",
+      "avdevice-62.dll": "7262f7b9c3f930d3bbf823af059ecbb13454f10f9d176b3e4f52182236e8658d",
+      "avutil-60.dll": "2b39e72ea094c29b57aff9b3b45489754904f2aeeaa625c3fc63bb9f49183c32",
+      "avformat-62.dll": "219e7a8b84fdc3699b5c1a8bf83f0b7a964e60689be812af17e845cc1c1b7b51",
+      "swscale-9.dll": "22fb103dec7fcd88d7f707c1a359e2c9641789fddb98b87bf2f892bdc016b161",
+      "avfilter-11.dll": "93ba232fcc387936ac22a530a6bc2426620dbbcf7a9e294ed340162854fb323f",
+      "swresample-6.dll": "660e3b005bc7b765cee64706c1ec14c269cb11cdc988a984037dfaf0da2e8cae"
+    },
+    "source": {
+      "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/27b8d1a017de62b51c0f3a039327b5cc2d7ea13f",
+      "sha256": "87a695bc61e16f4aa8437c2ab6c0bbe1ca572ceccec4a2e86013e36f49899b1e"
+    },
+    "build_scripts": {
+      "url": "https://codeload.github.com/BtbN/FFmpeg-Builds/tar.gz/c482a075076c29edf6dd9c5a7c9d3113d0babed6",
+      "sha256": "867c935f18d4b826a22442f81acc588cb6dfc7605011f8b1cda35beea06eaba7"
+    },
+    "rav1e_cargo_lock": "https://raw.githubusercontent.com/xiph/rav1e/564ae3b0007ae2b06893fd7166bf88c5a84c5b63/Cargo.lock"
+  },
+  "asio": {
+    "url": "https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip",
+    "sha256": "d5ebf0c20dd2c5f43771fd0c1418f4b361bf52434ee670097cfa6b3a335e2eca"
+  }
+}

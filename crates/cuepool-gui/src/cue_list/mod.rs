@@ -110,6 +110,32 @@ const CUE_TYPES: [(&str, &str, CueType); 13] = [
     ("⊞", "Pixel Map", CueType::PixelMap),
 ];
 
+/// Height of every cue-list cell, header and body alike.
+const CELL_HEIGHT: f32 = 18.0;
+
+/// Draws one cue-list cell: an exact `width` x [`CELL_HEIGHT`] rect, laid out
+/// with `layout` and clipped to that rect.
+///
+/// The cells used to be `ui.add_sized`, which centres a widget in the size it
+/// is given and lets a widget that does not fit extend past it. The row then
+/// continued after the overflow, so a long name, or the Trigger combo showing
+/// "After last", moved every later column on that row. A cell always advances
+/// the row by exactly `width`, and content that does not fit is cut off at the
+/// cell's edge.
+fn cell<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    layout: egui::Layout,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (_, rect) = ui.allocate_space(egui::vec2(width, CELL_HEIGHT));
+    let mut cell_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    // Intersects with the parent's clip rect, so the scroll area still clips
+    // rows scrolled out of view.
+    cell_ui.shrink_clip_rect(rect);
+    add_contents(&mut cell_ui)
+}
+
 pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     let (cues, selected_id, show_mode, active_positions, tc_fps) = {
         let Ok(state) = state.lock() else { return };
@@ -155,34 +181,109 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
     const COL_PLAYHEAD: f32 = 18.0;
     const COL_DRAG: f32 = 20.0;
     const COL_QID: f32 = 48.0;
-    const COL_NAME: f32 = 140.0;
-    const COL_TRIGGER: f32 = 70.0;
+    // Name's minimum width. Above it, Name takes what the other columns leave;
+    // it is low so a narrow panel shortens the name before the row overflows.
+    const COL_NAME: f32 = 80.0;
+    // Fits the combo showing "After last", the longest trigger label.
+    const COL_TRIGGER: f32 = 80.0;
     const COL_FIRE: f32 = 96.0;
     const COL_DURATION: f32 = 60.0;
-    const COL_LOOP: f32 = 24.0;
-    const COL_TYPE: f32 = 40.0;
+    // Fits the "Loop" header (29px), which the clipped cell would otherwise cut.
+    const COL_LOOP: f32 = 32.0;
+    // Fits the "Type" header and every badge. The 8px it gave up went to Loop,
+    // so the list still fits the default 1280px window without Name at its
+    // minimum.
+    const COL_TYPE: f32 = 32.0;
     const COL_COLOUR: f32 = 16.0;
+    // Show mode's play/pause marker, in front of the cue number.
+    const PLAY_MARKER_SLOT: f32 = 14.0;
     // Group members indent inside the row (not via frame margin) so every
     // column after Name stays aligned with the header and top-level rows.
     const GROUP_INDENT: f32 = 22.0;
     // Row frames have a 4px left inner margin; match it so headers line up.
     const ROW_MARGIN: f32 = 4.0;
 
+    // Show mode has no drag handle, and gives the play marker its own slot in
+    // the Q# cell so the number keeps the room it has in Edit mode.
+    let qid_w = if show_mode == crate::app::ShowMode::Edit {
+        COL_QID
+    } else {
+        COL_QID + PLAY_MARKER_SLOT
+    };
+    // Name takes the width the fixed columns leave, so a wider panel shows more
+    // of a long name and a narrower one truncates it sooner. At COL_NAME it
+    // stops shrinking, and the row runs past the panel's right edge instead.
+    // Each fixed cell brings one item_spacing gap, and the row frames have
+    // ROW_MARGIN on both sides.
+    let spacing = ui.spacing().item_spacing.x;
+    let drag_col: &[f32] = if show_mode == crate::app::ShowMode::Edit {
+        &[COL_DRAG]
+    } else {
+        &[]
+    };
+    let fixed_cols = [
+        COL_PLAYHEAD,
+        qid_w,
+        COL_TRIGGER,
+        COL_FIRE,
+        COL_DURATION,
+        COL_LOOP,
+        COL_TYPE,
+        COL_COLOUR,
+    ];
+    let fixed_w: f32 = fixed_cols.iter().chain(drag_col).map(|w| w + spacing).sum();
+    let name_w = (ui.available_width() - fixed_w - 2.0 * ROW_MARGIN)
+        .max(COL_NAME)
+        .floor();
+
+    // Q#, Name, Trigger and Fire read from the cell's left edge, Duration from
+    // its right, and Loop and Type are centred. Justified, so a label or a
+    // selectable fills its cell: the whole cell takes the click and shows the
+    // hover text, as it did before cells were clipped.
+    let left = egui::Layout::left_to_right(egui::Align::Center)
+        .with_main_align(egui::Align::Min)
+        .with_main_justify(true);
+    let right = egui::Layout::right_to_left(egui::Align::Center)
+        .with_main_align(egui::Align::Max)
+        .with_main_justify(true);
+    let centred = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
+
     ui.horizontal(|ui| {
         ui.add_space(ROW_MARGIN);
-        ui.add_sized([COL_PLAYHEAD, 18.0], egui::Label::new(""));
+        cell(ui, COL_PLAYHEAD, left, |_| {});
         if show_mode == crate::app::ShowMode::Edit {
-            ui.add_sized([COL_DRAG, 18.0], egui::Label::new(""));
+            cell(ui, COL_DRAG, left, |_| {});
         }
-        ui.add_sized([COL_QID, 18.0], egui::Label::new(RichText::new("#").strong()));
-        ui.add_sized([COL_NAME, 18.0], egui::Label::new(RichText::new("Name").strong()));
-        ui.add_sized([COL_TRIGGER, 18.0], egui::Label::new(RichText::new("Trigger").strong()));
-        ui.add_sized([COL_FIRE, 18.0], egui::Label::new(RichText::new("Fire").strong()))
+        // The Q# and Name cells are selectable buttons, and Edit mode's Trigger
+        // cell a combo, so their text starts button_padding in from the cell
+        // edge. The headers do the same so they sit over the text.
+        let text_inset = ui.spacing().button_padding.x;
+        cell(ui, qid_w, left, |ui| {
+            let mut inset = text_inset;
+            if show_mode == crate::app::ShowMode::Show {
+                // Past the play marker's slot and the gap the button puts
+                // after it.
+                inset += PLAY_MARKER_SLOT + ui.spacing().icon_spacing;
+            }
+            ui.add_space(inset);
+            ui.label(RichText::new("#").strong())
+        });
+        cell(ui, name_w, left, |ui| {
+            ui.add_space(text_inset);
+            ui.label(RichText::new("Name").strong())
+        });
+        cell(ui, COL_TRIGGER, left, |ui| {
+            if show_mode == crate::app::ShowMode::Edit {
+                ui.add_space(text_inset);
+            }
+            ui.label(RichText::new("Trigger").strong())
+        });
+        cell(ui, COL_FIRE, left, |ui| ui.label(RichText::new("Fire").strong()))
             .on_hover_text("Alternate firing methods (hotkey / MIDI / wall clock / timecode) — edit in the inspector's Triggers tab");
-        ui.add_sized([COL_DURATION, 18.0], egui::Label::new(RichText::new("Duration").strong()));
-        ui.add_sized([COL_LOOP, 18.0], egui::Label::new(RichText::new("Loop").strong()));
-        ui.add_sized([COL_TYPE, 18.0], egui::Label::new(RichText::new("Type").strong()));
-        ui.add_sized([COL_COLOUR, 18.0], egui::Label::new(""));
+        cell(ui, COL_DURATION, right, |ui| ui.label(RichText::new("Duration").strong()));
+        cell(ui, COL_LOOP, centred, |ui| ui.label(RichText::new("Loop").strong()));
+        cell(ui, COL_TYPE, centred, |ui| ui.label(RichText::new("Type").strong()));
+        cell(ui, COL_COLOUR, centred, |_| {});
     });
     ui.separator();
 
@@ -250,37 +351,39 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
 
                     // Painted rather than font-backed so the standby marker is
                     // distinct from the green playing glyph and always renders.
-                    let (marker_rect, marker_response) = ui.allocate_exact_size(
-                        egui::vec2(COL_PLAYHEAD, 18.0),
-                        egui::Sense::hover(),
-                    );
-                    if is_selected {
-                        let marker_color = ui.visuals().selection.stroke.color;
-                        let stroke = egui::Stroke::new(2.5_f32, marker_color);
-                        let x = marker_rect.center().x;
-                        let y = marker_rect.center().y;
-                        ui.painter().line_segment(
-                            [egui::pos2(x - 3.0, y - 5.0), egui::pos2(x + 2.0, y)],
-                            stroke,
+                    cell(ui, COL_PLAYHEAD, centred, |ui| {
+                        let (marker_rect, marker_response) = ui.allocate_exact_size(
+                            egui::vec2(COL_PLAYHEAD, CELL_HEIGHT),
+                            egui::Sense::hover(),
                         );
-                        ui.painter().line_segment(
-                            [egui::pos2(x + 2.0, y), egui::pos2(x - 3.0, y + 5.0)],
-                            stroke,
-                        );
-                        marker_response.on_hover_text("Standby: Go fires this cue");
-                    }
+                        if is_selected {
+                            let marker_color = ui.visuals().selection.stroke.color;
+                            let stroke = egui::Stroke::new(2.5_f32, marker_color);
+                            let x = marker_rect.center().x;
+                            let y = marker_rect.center().y;
+                            ui.painter().line_segment(
+                                [egui::pos2(x - 3.0, y - 5.0), egui::pos2(x + 2.0, y)],
+                                stroke,
+                            );
+                            ui.painter().line_segment(
+                                [egui::pos2(x + 2.0, y), egui::pos2(x - 3.0, y + 5.0)],
+                                stroke,
+                            );
+                            marker_response.on_hover_text("Standby: Go fires this cue");
+                        }
+                    });
 
                     if in_group {
                         ui.add_space(GROUP_INDENT);
                     }
                     // Absorb the indent in the Name column so later columns align.
-                    let name_w = if in_group { COL_NAME - GROUP_INDENT } else { COL_NAME };
+                    let name_w = if in_group { name_w - GROUP_INDENT } else { name_w };
 
                     // Drag handle (only in edit mode)
                     if show_mode == crate::app::ShowMode::Edit {
                         let drag_id = ui.auto_id_with(("drag", idx));
                         ui.dnd_drag_source(drag_id, idx, |ui| {
-                            ui.add_sized([COL_DRAG, 18.0], |ui: &mut egui::Ui| {
+                            cell(ui, COL_DRAG, centred, |ui| {
                                 ui.label(egui::RichText::new("≡").monospace().size(14.0))
                             });
                         })
@@ -301,15 +404,17 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             let edit_id = cell_id(qid, EditCell::Qid);
                             let pending = ui.data_mut(|d| d.get_temp::<String>(edit_id));
                             let mut qid_str = pending.clone().unwrap_or_else(|| qid.to_string());
-                            let response = ui.add_sized(
-                                [COL_QID, 18.0],
+                            let response = cell(ui, qid_w, left, |ui| {
                                 // Frameless so the row highlight (selected/active)
                                 // shows through the cell.
-                                egui::TextEdit::singleline(&mut qid_str)
-                                    .id(edit_id)
-                                    .frame(egui::Frame::NONE)
-                                    .font(egui::TextStyle::Monospace),
-                            );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut qid_str)
+                                        .id(edit_id)
+                                        .frame(egui::Frame::NONE)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                )
+                            });
                             // A focused TextEdit only surrenders focus on
                             // Enter/Tab/Esc; blur it on a click anywhere else so
                             // the edit ends.
@@ -336,10 +441,13 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                                 }
                             }
                         } else {
-                            let response = ui.add_sized([COL_QID, 18.0], |ui: &mut egui::Ui| {
-                                ui.selectable_label(
-                                    is_selected,
-                                    RichText::new(qid.to_string()).monospace(),
+                            let response = cell(ui, qid_w, left, |ui| {
+                                ui.add(
+                                    egui::Button::selectable(
+                                        is_selected,
+                                        RichText::new(qid.to_string()).monospace(),
+                                    )
+                                    .truncate(),
                                 )
                             });
                             if response.double_clicked() {
@@ -350,19 +458,47 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                     } else {
                         // QLab-style play marker: green ▶ for a playing cue
-                        // (amber when paused) in front of the cue number.
-                        let qid_str = if is_active { format!("▶ {qid}") } else { qid.to_string() };
-                        let response = ui.add_sized([COL_QID, 18.0], |ui: &mut egui::Ui| {
-                            let text = if is_active {
-                                RichText::new(&qid_str).color(if is_paused {
-                                    Color32::from_rgb(224, 172, 60)
-                                } else {
-                                    Color32::from_rgb(86, 200, 120)
-                                })
+                        // (amber when paused) in front of the cue number, which
+                        // takes the same colour. The marker has a slot of its
+                        // own on every row, so the number stays put when the cue
+                        // starts; it used to be a "▶ " prefix on the number.
+                        let play_colour = is_active.then(|| {
+                            if is_paused {
+                                Color32::from_rgb(224, 172, 60)
                             } else {
-                                RichText::new(&qid_str)
-                            };
-                            ui.selectable_label(is_selected, text)
+                                Color32::from_rgb(86, 200, 120)
+                            }
+                        });
+                        let response = cell(ui, qid_w, left, |ui| {
+                            let marker_id = egui::Id::new("play_marker");
+                            let mut number = RichText::new(qid.to_string());
+                            if let Some(colour) = play_colour {
+                                number = number.color(colour);
+                            }
+                            let button = egui::Button::selectable(
+                                is_selected,
+                                (
+                                    egui::Atom::custom(
+                                        marker_id,
+                                        egui::vec2(PLAY_MARKER_SLOT, 0.0),
+                                    ),
+                                    number,
+                                ),
+                            )
+                            .truncate()
+                            .atom_ui(ui);
+                            if let (Some(colour), Some(slot)) =
+                                (play_colour, button.rect(marker_id))
+                            {
+                                ui.painter().text(
+                                    slot.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    "▶",
+                                    egui::TextStyle::Button.resolve(ui.style()),
+                                    colour,
+                                );
+                            }
+                            button.response
                         });
                         if response.clicked() {
                             queue_select(state, qid);
@@ -378,14 +514,16 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     {
                         let edit_id = cell_id(qid, EditCell::Name);
                         let mut name_str = name.clone();
-                        let response = ui.add_sized(
-                            [name_w, 18.0],
+                        let response = cell(ui, name_w, left, |ui| {
                             // Frameless so the row highlight shows through.
-                            egui::TextEdit::singleline(&mut name_str)
-                                .id(edit_id)
-                                .frame(egui::Frame::NONE)
-                                .font(egui::TextStyle::Body),
-                        );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut name_str)
+                                    .id(edit_id)
+                                    .frame(egui::Frame::NONE)
+                                    .font(egui::TextStyle::Body)
+                                    .desired_width(f32::INFINITY),
+                            )
+                        });
                         if response.has_focus() && response.clicked_elsewhere() {
                             ui.memory_mut(|mem| mem.surrender_focus(response.id));
                         }
@@ -399,26 +537,30 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                         response.on_hover_text(name);
                     } else {
-                        let response = ui.add_sized([name_w, 18.0], |ui: &mut egui::Ui| {
-                            ui.selectable_label(is_selected, name.as_str())
+                        let response = cell(ui, name_w, left, |ui| {
+                            ui.add(egui::Button::selectable(is_selected, name.as_str()).truncate())
                         });
                         if show_mode == crate::app::ShowMode::Edit && response.double_clicked() {
                             open_editor(ui, qid, EditCell::Name);
                         } else if response.clicked() {
                             queue_select(state, qid);
                         }
-                        // The column is a fixed 140px, so a long name is cut off
-                        // with nothing to say it was.
+                        // A name wider than the column is cut to fit with an
+                        // ellipsis, so the full name is on hover.
                         response.on_hover_text(name);
                     }
 
-                    // Trigger column — constrain width so the combo doesn't expand the row
+                    // Trigger column. `ComboBox::width` is a minimum, not a cap,
+                    // so the combo used to grow with its label. The label now
+                    // truncates to the cell, and no truncated label needs more
+                    // than the whole cell, so every combo is the cell's width.
                     if show_mode == crate::app::ShowMode::Edit {
                         let mut trigger = base.trigger;
-                        let response = ui.add_sized([COL_TRIGGER, 18.0], |ui: &mut egui::Ui| {
+                        let response = cell(ui, COL_TRIGGER, left, |ui| {
                             egui::ComboBox::from_id_salt(egui::Id::new(("trigger", qid)))
                                 .selected_text(trigger_label(trigger))
-                                .width(COL_TRIGGER - 4.0)
+                                .width(COL_TRIGGER)
+                                .truncate()
                                 .show_ui(ui, |ui| {
                                     for mode in [
                                         cuepool_core::TriggerMode::Go,
@@ -437,7 +579,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             queue_cmd(state, AppCommand::UpdateCueTrigger { qid, trigger });
                         }
                     } else {
-                        ui.add_sized([COL_TRIGGER, 18.0], |ui: &mut egui::Ui| {
+                        cell(ui, COL_TRIGGER, left, |ui| {
                             ui.label(
                                 RichText::new(trigger_label(base.trigger))
                                     .monospace()
@@ -452,7 +594,7 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     // inspector's Triggers tab. Empty when none are configured.
                     {
                         let badges = trigger_badges(&base.triggers);
-                        ui.add_sized([COL_FIRE, 18.0], |ui: &mut egui::Ui| {
+                        cell(ui, COL_FIRE, left, |ui| {
                             ui.label(RichText::new(badges.join(" ")).monospace().size(10.0).weak())
                         })
                         .on_hover_text(describe_triggers(&base.triggers, tc_fps));
@@ -471,26 +613,27 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                         }
                         _ => "—".to_string(),
                     };
-                    ui.add_sized([COL_DURATION, 18.0], |ui: &mut egui::Ui| {
+                    cell(ui, COL_DURATION, right, |ui| {
                         if let Some((pos, len, _paused)) = active_positions.get(&qid)
                             && let Some(len) = len
-                                && *len > 0.0 {
-                                    let progress = (pos / len).clamp(0.0, 1.0);
-                                    let bar_width = COL_DURATION - 4.0;
-                                    let bar_height = 6.0;
-                                    let (rect, _response) = ui.allocate_exact_size(
-                                        egui::vec2(bar_width, bar_height),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 40));
-                                    let fill_rect = egui::Rect::from_min_size(
-                                        rect.min,
-                                        egui::vec2(bar_width * progress, bar_height),
-                                    );
-                                    ui.painter().rect_filled(fill_rect, 2.0, Color32::from_rgb(100, 180, 100));
-                                    return _response;
-                                }
-                        ui.label(RichText::new(&duration_str).monospace().size(10.0))
+                            && *len > 0.0
+                        {
+                            let progress = (pos / len).clamp(0.0, 1.0);
+                            let bar_width = COL_DURATION - 4.0;
+                            let bar_height = 6.0;
+                            let (rect, _response) = ui.allocate_exact_size(
+                                egui::vec2(bar_width, bar_height),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 40));
+                            let fill_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(bar_width * progress, bar_height),
+                            );
+                            ui.painter().rect_filled(fill_rect, 2.0, Color32::from_rgb(100, 180, 100));
+                        } else {
+                            ui.label(RichText::new(&duration_str).monospace().size(10.0));
+                        }
                     });
 
                     // Loop column
@@ -504,19 +647,19 @@ pub fn show(ui: &mut egui::Ui, state: &SharedStateHandle) {
                             ("H".to_string(), "Holds the last frame/value when it ends".to_string())
                         }
                     };
-                    ui.add_sized([COL_LOOP, 18.0], |ui: &mut egui::Ui| {
+                    cell(ui, COL_LOOP, centred, |ui| {
                         ui.label(RichText::new(loop_short).monospace().size(10.0))
                     })
                     .on_hover_text(loop_desc);
 
                     // Type column
-                    ui.add_sized([COL_TYPE, 18.0], |ui: &mut egui::Ui| {
+                    cell(ui, COL_TYPE, centred, |ui| {
                         ui.label(RichText::new(cue_type).monospace().size(10.0))
                     })
                     .on_hover_text(format!("{} cue", cue_type_name(cue)));
 
                     // Colour swatch
-                    ui.add_sized([COL_COLOUR, 18.0], |ui: &mut egui::Ui| {
+                    cell(ui, COL_COLOUR, centred, |ui| {
                         let (rect, response) = ui.allocate_exact_size(
                             egui::vec2(COL_COLOUR, 16.0),
                             egui::Sense::hover(),

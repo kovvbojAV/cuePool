@@ -33,6 +33,17 @@ pub enum OscEvent {
         qid: String,
     },
     Save,
+    /// `/qplayer/volume <dB> [request_id]` — set the show's master gain.
+    /// An optional int32 ID requests confirmation after the change is applied.
+    Volume {
+        db: f32,
+        reply: Option<(std::net::SocketAddr, i32)>,
+    },
+    /// `/qplayer/volume/get <request_id>` — read through the application queue.
+    VolumeQuery {
+        src: std::net::SocketAddr,
+        request_id: i32,
+    },
     RemoteDiscovery {
         name: String,
         addr: Option<std::net::SocketAddr>,
@@ -180,6 +191,7 @@ impl OscDriver {
         let running = Arc::clone(&self.running);
         self.rx_thread = Some(std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
+            let mut decode_errors = crate::WarnThrottle::new(std::time::Duration::from_secs(10));
             while running.load(std::sync::atomic::Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((len, src)) => match rosc::decoder::decode_udp(&buf[..len]) {
@@ -189,7 +201,12 @@ impl OscDriver {
                             }
                         }
                         Err(e) => {
-                            log::warn!("OSC decode error from {src}: {e}");
+                            if let Some(suppressed) = decode_errors.tick(std::time::Instant::now())
+                            {
+                                log::warn!(
+                                    "OSC decode error from {src}: {e} ({suppressed} similar suppressed)"
+                                );
+                            }
                         }
                     },
                     // An idle port: the read timeout expired with nothing to
@@ -417,6 +434,27 @@ impl OscManager {
             let tx = event_tx.clone();
             r.subscribe("/qplayer/save", move |_msg, _src| {
                 let _ = tx.send(OscEvent::Save);
+            });
+
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/volume", move |msg, src| {
+                let (level, reply) = match msg.args.as_slice() {
+                    [level] => (level, None),
+                    [level, OscType::Int(request_id)] => (level, Some((src, *request_id))),
+                    _ => return,
+                };
+                if let Some(db) = arg_to_f32(level) {
+                    let _ = tx.send(OscEvent::Volume { db, reply });
+                }
+            });
+            let tx = event_tx.clone();
+            r.subscribe("/qplayer/volume/get", move |msg, src| {
+                if let [OscType::Int(request_id)] = msg.args.as_slice() {
+                    let _ = tx.send(OscEvent::VolumeQuery {
+                        src,
+                        request_id: *request_id,
+                    });
+                }
             });
 
             // Path form: the cue number as a trailing address segment

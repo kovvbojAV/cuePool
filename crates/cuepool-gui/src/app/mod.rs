@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod changes;
 mod identity_card;
 
 pub use identity_card::torus_colour;
@@ -23,7 +24,7 @@ const MAX_AUTOMATION_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
 /// the previous release's copy with the new version. `release_notes_match_the_release`
 /// fails while this trails the package minor, which is the reminder to rewrite
 /// the modal body before bumping it (see AGENTS.md).
-pub const RELEASE_NOTES_VERSION: &str = "0.12";
+pub const RELEASE_NOTES_VERSION: &str = "0.13";
 
 /// A full snapshot of editable state for undo/redo.
 #[derive(Debug, Clone)]
@@ -523,6 +524,7 @@ pub struct SharedState {
     pub show_log_window: bool,
     /// Whether Help → About has asked for the identity card.
     pub show_about_window: bool,
+    pub show_changes_window: bool,
     /// Whether the Status diagnostics window is open.
     pub show_status_window: bool,
     /// Live snapshot behind the Status window, published by the engine.
@@ -691,6 +693,7 @@ impl Default for SharedState {
             audio_devices: Vec::new(),
             show_log_window: false,
             show_about_window: false,
+            show_changes_window: false,
             show_status_window: false,
             diagnostics: Diagnostics::default(),
             show_waveform_window: false,
@@ -760,7 +763,7 @@ impl SharedState {
         path: &std::path::Path,
         data: &str,
     ) -> Result<(), serde_json::Error> {
-        let show: ShowFile = serde_json::from_str(data)?;
+        let show = cuepool_core::parse_show_file(data)?;
         self.apply_show_file(path, show);
         Ok(())
     }
@@ -839,7 +842,15 @@ pub enum AppCommand {
         to_idx: usize,
         parent: Option<Decimal>,
     },
-    SetLimiterThreshold(f32),
+    /// Master output gain in dB from OSC `/qplayer/volume`. The Project
+    /// Settings fader edits the show setting directly and re-applies with
+    /// [`AppCommand::ApplyAudioSettings`].
+    SetMasterVolume(f32),
+    /// Reply from the application queue, after preceding volume changes.
+    QueryMasterVolume {
+        reply_to: std::net::SocketAddr,
+        request_id: i32,
+    },
     SetAudioDriver(cuepool_core::AudioOutputDriver),
     SetAudioDevice(String),
     ApplyAudioSettings,
@@ -1184,7 +1195,7 @@ impl CuePoolApp {
     }
 
     fn apply_project_text(&mut self, path: &std::path::Path, data: &str) -> Result<(), String> {
-        let show = serde_json::from_str(data)
+        let show = cuepool_core::parse_show_file(data)
             .map_err(|error| format!("failed to parse '{}': {error}", path.display()))?;
         self.apply_project_show(path, show)
     }
@@ -1249,7 +1260,7 @@ pub fn prepare_unattended_project(path: &std::path::Path) -> Result<PreparedProj
             MAX_AUTOMATION_PROJECT_BYTES / 1024 / 1024
         ));
     }
-    let show = serde_json::from_str(&data)
+    let show = cuepool_core::parse_show_file(&data)
         .map_err(|error| format!("failed to parse '{}': {error}", canonical.display()))?;
     Ok(PreparedProject {
         path: canonical,
@@ -1572,7 +1583,7 @@ impl CuePoolApp {
         };
         if show_settings {
             let mut settings_changed = false;
-            let mut limiter_cmd: Option<AppCommand> = None;
+            let mut levels_changed = false;
             let mut audio_driver_cmd: Option<AppCommand> = None;
             let mut audio_device_cmd: Option<AppCommand> = None;
             egui::Window::new("Project Settings")
@@ -1588,9 +1599,6 @@ impl CuePoolApp {
                         let ltc_inputs = state.ltc_input_devices.clone();
                         let ltc_outputs = state.ltc_output_devices.clone();
                         let audio_error = state.audio_error.clone();
-                        let threshold = state.command_queue.iter().rev().find_map(|cmd| {
-                            if let AppCommand::SetLimiterThreshold(t) = cmd { Some(*t) } else { None }
-                        }).unwrap_or(0.95);
                         let settings = &mut state.show_file.show_settings;
 
                         egui::CollapsingHeader::new("Show Info").default_open(true).show(ui, |ui| {
@@ -1685,13 +1693,28 @@ impl CuePoolApp {
                                 );
                             }
 
-                            ui.label("Master Limiter Threshold:");
-                            let mut db = 20.0 * threshold.log10();
-                            let response = ui.add(egui::Slider::new(&mut db, -24.0..=0.0).text("dB"));
-                            if response.changed() {
-                                let linear = 10.0f32.powf(db / 20.0);
-                                limiter_cmd = Some(AppCommand::SetLimiterThreshold(linear));
-                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Master Volume:").on_hover_text(
+                                    "Room trim ahead of the limiter — also set by OSC /qplayer/volume",
+                                );
+                                if crate::master_fader::show(ui, &mut settings.master_volume_db) {
+                                    settings_changed = true;
+                                    levels_changed = true;
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Master Limiter Threshold:")
+                                    .on_hover_text("Brick-wall ceiling on the master bus");
+                                let mut db = settings.limiter_threshold_db();
+                                if ui
+                                    .add(egui::Slider::new(&mut db, -24.0..=0.0).text("dB").fixed_decimals(1))
+                                    .changed()
+                                {
+                                    settings.set_limiter_threshold_db(db);
+                                    settings_changed = true;
+                                    levels_changed = true;
+                                }
+                            });
                         });
                         ui.separator();
 
@@ -2002,8 +2025,8 @@ impl CuePoolApp {
                 if settings_changed {
                     state.dirty = true;
                 }
-                if let Some(cmd) = limiter_cmd {
-                    state.command_queue.push(cmd);
+                if levels_changed {
+                    state.command_queue.push(AppCommand::ApplyAudioSettings);
                 }
                 if let Some(cmd) = audio_driver_cmd {
                     state.command_queue.push(cmd);
@@ -2335,9 +2358,9 @@ impl CuePoolApp {
                         .color(egui::Color32::from_rgb(255, 184, 92)),
                 );
                 ui.add_space(4.0);
-                ui.heading("Endings that fade instead of cut");
+                ui.heading("Versioned installs and clearer build details");
                 ui.label(
-                    "A Stop cue can now bring the whole show down gently: its fade applies to Stop All, and a stop aimed at a Group takes every member with it — video, its audio and all.",
+                    "Install a published CuePool release on Windows, check exactly which build is running, and keep remote volume controls in sync with the show.",
                 );
                 ui.add_space(12.0);
                 ui.separator();
@@ -2345,16 +2368,16 @@ impl CuePoolApp {
 
                 for (title, detail) in [
                     (
-                        "Stop All honours its fade",
-                        "A Stop cue with Stop All ticked fades every playing cue and the video out together over the cue's fade time. The transport's Stop button stays an instant cut for emergencies.",
+                        "Windows installers and portable packages",
+                        "Each release includes an MSI installer and a portable ZIP with the required runtime libraries and ASIO support. Your audio device's ASIO driver is still installed separately.",
                     ),
                     (
-                        "Stopping a group stops its members",
-                        "A stop aimed at a Group cue now reaches everything inside it, nested groups included. One cue ends a whole chain smoothly.",
+                        "Check the running build",
+                        "Help > About shows the version and source revision. Help > Changes lists changes from the available release or version-tag baseline, including local edits in development builds.",
                     ),
                     (
-                        "A stop means stop",
-                        "Stopping a cue that is still waiting on its delay cancels it, and a faded Stop All will not fire follow-on cues once the fade lands.",
+                        "Master-volume feedback over OSC",
+                        "Remote controls can query the current master volume and receive updates when it changes. The included Nodel volume control follows changes made in CuePool.",
                     ),
                 ] {
                     ui.label(
@@ -2368,7 +2391,7 @@ impl CuePoolApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Also: camera-based projection auto-blend over OSC (/qplayer/projection/autoblend/…) measures warp, edge blend and gamma for you, with per-output bypass switches for projectors that blend in hardware; volume and pan changes land on a playing cue without restarting it, typing in a cue field no longer fires the show, Show mode locks out every editing path, and undo keeps whole edits instead of their last keystroke.",
+                        "Also: a final Stop All cue no longer rearms the show clock.",
                     )
                     .small()
                     .color(egui::Color32::from_gray(180)),
@@ -2427,6 +2450,15 @@ impl CuePoolApp {
                     state.show_about_window = false;
                 }
             }
+        }
+
+        let mut show_changes = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.show_changes_window);
+        changes::show(ctx, &mut show_changes);
+        if let Ok(mut state) = self.state.lock() {
+            state.show_changes_window = show_changes;
         }
 
         // Sampled after the panels have laid out, so the next frame can tell an
@@ -2536,7 +2568,7 @@ impl CuePoolApp {
                         // Same deserialize path as OpenProject, minus the replace.
                         match std::fs::read_to_string(&path)
                             .map_err(|e| e.to_string())
-                            .and_then(|data| serde_json::from_str::<ShowFile>(&data).map_err(|e| e.to_string()))
+                            .and_then(|data| cuepool_core::parse_show_file(&data).map_err(|e| e.to_string()))
                         {
                             Ok(show) => {
                                 let name = path
@@ -2724,6 +2756,12 @@ impl CuePoolApp {
                     }
                     ui.close();
                 }
+                if ui.button("Changes…").clicked() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.show_changes_window = true;
+                    }
+                    ui.close();
+                }
                 if ui.button("About CuePool").clicked() {
                     if let Ok(mut state) = self.state.lock() {
                         state.show_about_window = true;
@@ -2735,7 +2773,7 @@ impl CuePoolApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let (active_count, cue_count, show_mode, dirty, video) = {
+        let (active_count, cue_count, show_mode, dirty, video, master_db) = {
             let Ok(state) = self.state.lock() else {
                 return;
             };
@@ -2745,8 +2783,10 @@ impl CuePoolApp {
                 state.show_mode,
                 state.dirty,
                 state.diagnostics.video.clone(),
+                state.show_file.show_settings.master_volume_db,
             )
         };
+        let mut open_settings = false;
 
         ui.horizontal(|ui| {
             // Status text
@@ -2806,6 +2846,30 @@ impl CuePoolApp {
 
                 ui.separator();
 
+                // Master trim, only while it is doing something: a quiet show
+                // should say why on the main screen. Click opens the settings.
+                if master_db != 0.0 {
+                    let text = format!(
+                        "Master {}",
+                        crate::master_fader::format_master_db(master_db)
+                    );
+                    if ui
+                        .add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .small()
+                                    .color(egui::Color32::YELLOW),
+                            )
+                            .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Master output gain is not 0 dB — Project Settings → Audio")
+                        .clicked()
+                    {
+                        open_settings = true;
+                    }
+                    ui.separator();
+                }
+
                 // Video decode path — the same diagnostic Help → Status carries,
                 // put where an operator will actually notice acceleration going
                 // away. A silent fall back to CPU decode is the difference
@@ -2815,6 +2879,9 @@ impl CuePoolApp {
                     .on_hover_text(video_tip);
             });
         });
+        if open_settings && let Ok(mut state) = self.state.lock() {
+            state.show_settings_window = true;
+        }
     }
 
     /// Gate a destructive command (New / Open) behind the in-app discard modal.
@@ -3451,7 +3518,7 @@ impl CuePoolApp {
             };
             serde_json::to_string_pretty(&state.show_file)?
         };
-        std::fs::write(path, json)?;
+        crate::atomic_write::write_atomically(path, json.as_bytes())?;
         if let Ok(mut state) = self.state.lock() {
             state.project_path = Some(path.to_path_buf());
             state.dirty = false;
@@ -3589,7 +3656,7 @@ impl CuePoolApp {
             }
 
             let json = serde_json::to_string_pretty(&state.show_file)?;
-            std::fs::write(&proj_path, json)?;
+            crate::atomic_write::write_atomically(&proj_path, json.as_bytes())?;
             state.project_path = Some(proj_path.clone());
             state.dirty = false;
             state.push_recent_file(&proj_path);

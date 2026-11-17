@@ -1,0 +1,47 @@
+name: Release preparation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+concurrency:
+  group: release-preparation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    # Only trusted current main is read; never consume a run's checkout/artifacts.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: candidate
+        run: python3 .github/scripts/release.py can-prepare
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0
+        if: steps.candidate.outputs.ready == 'true'
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        if: steps.candidate.outputs.ready == 'true'
+        with:
+          tool: release-plz@0.3.169
+      - name: Maintain product release PR
+        if: steps.candidate.outputs.ready == 'true'
+        env:
+          GIT_TOKEN: ${{ github.token }}
+        # GitHub requires a user with write access to approve CI runs on PRs
+        # created or updated with this token. See docs/releases.md.
+        run: python3 scripts/prepare-release.py release-pr
