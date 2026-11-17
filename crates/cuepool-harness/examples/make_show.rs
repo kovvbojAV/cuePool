@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         cues: vec![Cue::Video {
             base,
             // Absolute, so the project can live anywhere.
-            path: video.clone().into(),
+            path: video.clone(),
             start_time: Timespan::ZERO,
             // Zero means "play to the end".
             duration: Timespan::ZERO,
@@ -36,6 +36,8 @@ fn main() -> anyhow::Result<()> {
             routing: AudioRouting::default(),
             follow_mtc: false,
             mtc_start: Timespan::ZERO,
+            layer: 1,
+            region: None,
         }],
         ..ShowFile::default()
     };

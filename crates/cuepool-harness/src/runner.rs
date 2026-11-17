@@ -21,6 +21,7 @@ pub enum RunnerTrace {
         qid: Decimal,
         instance_id: u64,
         epoch: u64,
+        layer: u8,
         pts: f64,
     },
     VideoEof {
@@ -48,6 +49,7 @@ struct HeadlessVideo {
     qid: Decimal,
     instance_id: u64,
     epoch: u64,
+    layer: u8,
     path: String,
     source: VideoSource,
     pending: Option<VideoFrame>,
@@ -58,10 +60,12 @@ struct HeadlessVideo {
 }
 
 impl HeadlessVideo {
+    #[allow(clippy::too_many_arguments)] // Mirrors the PlayVideo engine action.
     fn open(
         qid: Decimal,
         instance_id: u64,
         epoch: u64,
+        layer: u8,
         path: String,
         media_offset_secs: f64,
         now: Duration,
@@ -78,6 +82,7 @@ impl HeadlessVideo {
             qid,
             instance_id,
             epoch,
+            layer,
             path,
             source,
             pending: None,
@@ -126,7 +131,8 @@ pub struct HeadlessShowRunner {
     engine: ShowEngine,
     sink: NullSink,
     clock: VirtualClock,
-    video: Option<HeadlessVideo>,
+    /// One decoder per busy video layer.
+    videos: Vec<HeadlessVideo>,
     trace: Vec<RunnerTrace>,
 }
 
@@ -144,7 +150,7 @@ impl HeadlessShowRunner {
             engine: ShowEngine::from_show_file(show, Some(path.to_path_buf()), Some(audio)),
             sink,
             clock: VirtualClock::new(SAMPLE_RATE, block_frames),
-            video: None,
+            videos: Vec::new(),
             trace: Vec::new(),
         })
     }
@@ -161,7 +167,7 @@ impl HeadlessShowRunner {
             state.selected_cue_id = None;
             state.project_generation = state.project_generation.wrapping_add(1);
         }
-        self.video = None;
+        self.videos.clear();
         Ok(())
     }
 
@@ -229,17 +235,21 @@ impl HeadlessShowRunner {
                     epoch,
                     path,
                     start_time,
+                    layer,
                     ..
                 } => {
-                    self.video = Some(HeadlessVideo::open(
+                    self.videos.retain(|video| video.layer != layer);
+                    self.videos.push(HeadlessVideo::open(
                         qid,
                         instance_id,
                         epoch,
+                        layer,
                         path,
                         start_time.as_secs_f64(),
                         self.clock.elapsed(),
                         self.engine.is_paused(),
                     )?);
+                    self.videos.sort_by_key(|video| video.layer);
                 }
                 EngineAction::SeekVideo {
                     qid,
@@ -256,17 +266,20 @@ impl HeadlessShowRunner {
                         paused,
                     });
                     if let Some(video) = self
-                        .video
-                        .as_mut()
-                        .filter(|video| video.instance_id == instance_id)
+                        .videos
+                        .iter_mut()
+                        .find(|video| video.instance_id == instance_id)
                     {
                         video.set_paused(paused, self.clock.elapsed());
                         video.seek(target_secs, media_offset_secs, self.clock.elapsed())?;
                     }
                 }
-                EngineAction::StopVideo { .. } => self.video = None,
+                EngineAction::StopVideo { layer: None, .. } => self.videos.clear(),
+                EngineAction::StopVideo {
+                    layer: Some(layer), ..
+                } => self.videos.retain(|video| video.layer != layer),
                 EngineAction::SetVideoPaused(paused) => {
-                    if let Some(video) = &mut self.video {
+                    for video in &mut self.videos {
                         video.set_paused(paused, self.clock.elapsed());
                     }
                 }
@@ -298,14 +311,23 @@ impl HeadlessShowRunner {
     }
 
     fn consume_due_video(&mut self) -> Result<()> {
+        let layers = self
+            .videos
+            .iter()
+            .map(|video| video.layer)
+            .collect::<Vec<_>>();
+        for layer in layers {
+            self.consume_due_layer(layer)?;
+        }
+        Ok(())
+    }
+
+    fn consume_due_layer(&mut self, layer: u8) -> Result<()> {
         let now = self.clock.elapsed();
-        let Some(video) = &mut self.video else {
+        let Some(video) = self.videos.iter_mut().find(|video| video.layer == layer) else {
             return Ok(());
         };
-        if video.paused_position.is_some() {
-            return Ok(());
-        }
-        if video.eof {
+        if video.paused_position.is_some() || video.eof {
             return Ok(());
         }
         let due_media = video.position(now) + video.media_offset_secs;
@@ -314,17 +336,7 @@ impl HeadlessShowRunner {
             if video.pending.is_none() {
                 video.pending = video.source.read_frame();
                 if video.pending.is_none() {
-                    let (qid, instance_id, epoch) = (video.qid, video.instance_id, video.epoch);
                     video.eof = true;
-                    self.trace.push(RunnerTrace::VideoEof {
-                        qid,
-                        instance_id,
-                        epoch,
-                    });
-                    let actions = self
-                        .engine
-                        .event(EngineEvent::VideoEof { instance_id, epoch }, now);
-                    self.apply_actions(actions)?;
                     break;
                 }
             }
@@ -338,13 +350,27 @@ impl HeadlessShowRunner {
             }
             break;
         }
-        if let (Some(video), Some(frame)) = (&self.video, newest) {
+        let (qid, instance_id, epoch, eof) = (video.qid, video.instance_id, video.epoch, video.eof);
+        // Production order: EOF follows the final frame through the decode channel.
+        if let Some(frame) = newest {
             self.trace.push(RunnerTrace::VideoFrame {
-                qid: video.qid,
-                instance_id: video.instance_id,
-                epoch: video.epoch,
+                qid,
+                instance_id,
+                epoch,
+                layer,
                 pts: frame.pts,
             });
+        }
+        if eof {
+            self.trace.push(RunnerTrace::VideoEof {
+                qid,
+                instance_id,
+                epoch,
+            });
+            let actions = self
+                .engine
+                .event(EngineEvent::VideoEof { instance_id, epoch }, now);
+            self.apply_actions(actions)?;
         }
         Ok(())
     }

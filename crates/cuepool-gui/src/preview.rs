@@ -67,6 +67,8 @@ pub fn demo_show() -> ShowFile {
             routing: AudioRouting::default(),
             follow_mtc: false,
             mtc_start: Timespan::from_secs_f64(3600.0),
+            layer: 1,
+            region: None,
         },
         Cue::Text {
             base: CueBase {

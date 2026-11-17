@@ -3074,6 +3074,8 @@ impl CuePoolApp {
                                 routing: cuepool_core::AudioRouting::default(),
                                 follow_mtc: false,
                                 mtc_start: cuepool_core::Timespan::from_secs_f64(3600.0),
+                                layer: cuepool_core::cue::default_video_layer(),
+                                region: None,
                             },
                             CueType::Stop => cuepool_core::Cue::Stop {
                                 base,
