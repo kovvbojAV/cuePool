@@ -99,7 +99,20 @@ pub fn video(qid: i64, loop_mode: LoopMode) -> Cue {
         routing: AudioRouting::default(),
         follow_mtc: false,
         mtc_start: Timespan::ZERO,
+        layer: 1,
+        region: None,
     }
+}
+
+/// `video` on a given layer and trigger.
+pub fn layered_video(qid: i64, layer: u8, trigger: TriggerMode, loop_mode: LoopMode) -> Cue {
+    let mut cue = video(qid, loop_mode);
+    cue.base_mut().trigger = trigger;
+    let Cue::Video { layer: slot, .. } = &mut cue else {
+        unreachable!()
+    };
+    *slot = layer;
+    cue
 }
 
 pub fn hap_video(qid: i64, loop_mode: LoopMode) -> Cue {

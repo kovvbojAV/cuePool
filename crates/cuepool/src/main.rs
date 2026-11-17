@@ -81,8 +81,9 @@ mod windows_console;
 #[cfg(windows)]
 use video_pipeline::win_timer;
 use video_pipeline::{
-    CanvasCommand, OutputFrameState, VideoControl, VideoMessage, VideoSeekFrameRequest,
-    pixmap_decode_thread, video_consume_thread, video_decode_thread,
+    CanvasCommand, OutputFrameState, VIDEO_LAYERS, VideoControl, VideoMessage,
+    VideoSeekFrameRequest, layer_index, pixmap_decode_thread, video_consume_thread,
+    video_decode_thread,
 };
 use video_timing::{fade_elapsed, shift_fade_start_after_pause};
 
@@ -307,9 +308,9 @@ fn control_surface_retry_delay(failures: u32) -> Duration {
 #[derive(Debug)]
 enum AppEvent {
     /// The consume thread uploaded the stream's final due frame.
-    VideoEof(u64),
+    VideoEof { layer: usize, epoch: u64 },
     /// The decoder terminated without a recoverable frame; unlike EOF this never loops.
-    VideoFailed(u64),
+    VideoFailed { layer: usize, epoch: u64 },
     /// An output worker needs winit to recreate its window-owned surface.
     OutputSurfaceLost(WindowId),
     /// The shared GPU device is gone; recovery requires rebuilding all resources.
@@ -319,6 +320,31 @@ enum AppEvent {
 enum TerminalError {
     Startup(String),
     Runtime(&'static str),
+}
+
+/// Winit-side runtime for one video layer. The consume-thread side lives in
+/// `VideoControl::layers` at the same index.
+#[derive(Default)]
+struct VideoLayerRuntime {
+    /// QID of the cue whose video (or, on layer 1, still image) is showing.
+    qid: Option<rust_decimal::Decimal>,
+    instance_id: Option<u64>,
+    /// The decode thread is a bounded producer; backpressure keeps decode a
+    /// few frames ahead of the clock.
+    stop_flag: Arc<AtomicBool>,
+    decode_join: Option<std::thread::JoinHandle<()>>,
+    pending_decode: Option<VideoDecodeRequest>,
+    hap_fallback_session: HapFallbackSession,
+    hap_fallback_instance_id: Option<u64>,
+    /// Consecutive failed opens of this layer's video. A storage hiccup or a
+    /// file briefly unavailable retries; a genuinely damaged file gives up
+    /// after MAX_VIDEO_OPEN_RETRIES and tells the operator.
+    open_retries: u32,
+    /// This layer's video follows MTC.
+    mtc_follow: Option<MtcFollowState>,
+    /// When the last MTC hard sync reopened this layer's media, so a
+    /// scrubbing source cannot drive a continuous stream of container opens.
+    last_hard_sync: Option<Instant>,
 }
 
 struct VideoDecodeRequest {
@@ -598,26 +624,16 @@ struct App {
     /// Kept for render threads to request winit-side surface rebuilds; the
     /// consume thread gets its own clone at construction.
     event_loop_proxy: winit::event_loop::EventLoopProxy<AppEvent>,
-    /// The decode channel, clock, pause/step/fade state and frame consumption
-    /// live in `video_control` (shared with the consume thread, which owns the
-    /// canvas upload + convert + publish path). The decode thread is a bounded
-    /// producer; backpressure keeps decode a few frames ahead of the clock.
-    video_stop_flag: Arc<AtomicBool>,
-    video_decode_join: Option<std::thread::JoinHandle<()>>,
-    pending_video_decode: Option<VideoDecodeRequest>,
+    /// Per-layer decode threads and cue identity. The decode channels, clocks,
+    /// pause/step/fade state and frame consumption live in `video_control`
+    /// (shared with the consume thread, which owns the upload + convert +
+    /// composite + publish path).
+    video_layers: [VideoLayerRuntime; VIDEO_LAYERS],
+    /// The show transport pauses every layer's decoder together.
     video_pause_flag: Arc<AtomicBool>,
     frame_pool: Arc<FramePool>,
     zero_copy: ZeroCopyAvailability,
     hap_acceleration: HapAcceleration,
-    hap_fallback_session: HapFallbackSession,
-    hap_fallback_instance_id: Option<u64>,
-    /// Consecutive failed opens of the current video. A storage hiccup or a
-    /// file briefly unavailable retries; a genuinely damaged file gives up
-    /// after MAX_VIDEO_OPEN_RETRIES and tells the operator.
-    video_open_retries: u32,
-    /// QID of the cue whose video is currently playing (for loop sync).
-    current_video_qid: Option<rust_decimal::Decimal>,
-    current_video_instance_id: Option<u64>,
     /// Last `SharedState.project_generation` we acted on. A change means a project
     /// was loaded, so the output windows must rebuild for its projection settings.
     last_project_generation: u64,
@@ -686,15 +702,11 @@ struct App {
     ltc_out_retry: Instant,
     /// Encode scratch, kept out of the per-frame path.
     ltc_scratch: Vec<f32>,
-    /// The video cue currently following MTC, if any.
-    mtc_follow: Option<MtcFollowState>,
-    /// Last measured drift (target − video position) while following, for the GUI.
+    /// Last measured drift (target − video position) of the lowest following
+    /// layer, for the GUI.
     mtc_drift: Option<f64>,
     /// Last frame rate we warned about (rate-limits the non-25fps warning).
     mtc_warned_fps: Option<MtcFrameRate>,
-    /// When the last hard sync reopened the media, so a scrubbing source
-    /// cannot drive a continuous stream of container opens.
-    last_hard_sync: Option<Instant>,
 
     // ── lighting ──
     lighting: LightingEngine,
@@ -1067,18 +1079,11 @@ impl App {
             consume_failure_reported: false,
             published_outputs: Vec::new(),
             autoblend: autoblend::AutoBlend::new(),
-            video_stop_flag: Arc::new(AtomicBool::new(false)),
-            video_decode_join: None,
-            pending_video_decode: None,
+            video_layers: Default::default(),
             video_pause_flag: Arc::new(AtomicBool::new(false)),
             frame_pool,
             zero_copy,
             hap_acceleration,
-            hap_fallback_session: HapFallbackSession::default(),
-            hap_fallback_instance_id: None,
-            video_open_retries: 0,
-            current_video_qid: None,
-            current_video_instance_id: None,
             last_project_generation: 0,
             last_active_cue_publish: Instant::now() - Duration::from_secs(1),
             last_control_redraw: std::time::Instant::now(),
@@ -1108,10 +1113,8 @@ impl App {
             // Try again on the first tick if startup open failed.
             ltc_out_retry: Instant::now() - Duration::from_secs(10),
             ltc_scratch: Vec::new(),
-            mtc_follow: None,
             mtc_drift: None,
             mtc_warned_fps: None,
-            last_hard_sync: None,
             last_window_title: String::new(),
             autosave_running,
             paused: false,
@@ -1389,44 +1392,60 @@ impl App {
                     duration,
                     follow_mtc,
                     mtc_start,
+                    layer,
+                    region,
                     ..
                 } => {
+                    let li = layer_index(layer);
                     self.play_video(
+                        li,
                         &path,
                         qid,
                         instance_id,
                         clock_origin,
                         start_time,
                         duration,
+                        region,
                         event_loop,
                     );
-                    if follow_mtc {
-                        self.mtc_follow = Some(MtcFollowState {
-                            qid,
-                            path,
-                            offset_secs: mtc_start.as_secs_f64(),
-                            hold_position: Some(0.0),
-                            last_tick: Instant::now(),
-                            last_mtc_secs: 0.0,
-                            last_mtc_at: Instant::now(),
-                        });
-                    } else {
-                        self.mtc_follow = None;
-                    }
+                    self.video_layers[li].mtc_follow = follow_mtc.then(|| MtcFollowState {
+                        qid,
+                        path,
+                        offset_secs: mtc_start.as_secs_f64(),
+                        hold_position: Some(0.0),
+                        last_tick: Instant::now(),
+                        last_mtc_secs: 0.0,
+                        last_mtc_at: Instant::now(),
+                    });
                 }
                 EngineAction::SeekVideo {
                     qid,
+                    layer,
                     path,
                     target_secs,
                     media_offset_secs,
                     ..
-                } => self.seek_video_cue(qid, &path, target_secs, media_offset_secs)?,
-                EngineAction::StopVideo { fade_out_secs } => {
-                    if fade_out_secs > 0.0 {
-                        self.video_control.lock_unpoisoned().fade =
-                            Some((Instant::now(), fade_out_secs));
-                    } else {
-                        self.stop_video_playback();
+                } => self.seek_video_cue(
+                    layer_index(layer),
+                    qid,
+                    &path,
+                    target_secs,
+                    media_offset_secs,
+                )?,
+                EngineAction::StopVideo {
+                    layer,
+                    fade_out_secs,
+                } => {
+                    let layers = match layer {
+                        Some(layer) => layer_index(layer)..layer_index(layer) + 1,
+                        None => 0..VIDEO_LAYERS,
+                    };
+                    for li in layers {
+                        self.stop_video_layer(li, fade_out_secs);
+                    }
+                    // The composite repaints around a layer that stops while
+                    // others play; the last one out blanks the canvas.
+                    if fade_out_secs <= 0.0 && self.video_layers.iter().all(|l| l.qid.is_none()) {
                         let _ = self.canvas_cmd_tx.send(CanvasCommand::BlankCanvas);
                     }
                 }
@@ -1449,15 +1468,15 @@ impl App {
                     {
                         self.stop_pixmap();
                     }
-                    if self.current_video_qid == Some(qid)
-                        && self.show_engine.current_video_qid() != Some(qid)
+                    // A still image shares the video slots (layer 1) but is not a
+                    // video to the engine, so it stops here.
+                    if !self.show_engine.is_video_playing(qid)
                         && mode != cuepool_core::StopMode::LoopEnd
                     {
-                        if fade_out_secs > 0.0 {
-                            self.video_control.lock_unpoisoned().fade =
-                                Some((Instant::now(), fade_out_secs));
-                        } else {
-                            self.stop_video_playback();
+                        for li in 0..VIDEO_LAYERS {
+                            if self.video_layers[li].qid == Some(qid) {
+                                self.stop_video_layer(li, fade_out_secs);
+                            }
                         }
                     }
                 }
@@ -1487,21 +1506,45 @@ impl App {
         self.paused = paused;
         let mut ctl = self.video_control.lock_unpoisoned();
         ctl.paused = paused;
-        if paused {
-            ctl.pause_started = Some(Instant::now());
-        } else if let Some(paused_at) = ctl.pause_started.take() {
-            let resumed_at = Instant::now();
-            if let Some(clock) = ctl.clock.as_mut() {
-                *clock += resumed_at.saturating_duration_since(paused_at);
-            }
-            if let Some((start, _)) = ctl.fade.as_mut() {
-                *start = shift_fade_start_after_pause(*start, paused_at, resumed_at);
+        for stream in &mut ctl.layers {
+            if paused {
+                stream.pause_started = Some(Instant::now());
+            } else if let Some(paused_at) = stream.pause_started.take() {
+                let resumed_at = Instant::now();
+                if let Some(clock) = stream.clock.as_mut() {
+                    *clock += resumed_at.saturating_duration_since(paused_at);
+                }
+                if let Some((start, _)) = stream.fade.as_mut() {
+                    *start = shift_fade_start_after_pause(*start, paused_at, resumed_at);
+                }
             }
         }
     }
 
+    /// The engine's view of the video playing on layer index `li`.
+    fn engine_video_on_layer(&self, li: usize) -> Option<cuepool::VideoSnapshot> {
+        self.show_engine
+            .snapshot()
+            .videos
+            .into_iter()
+            .find(|video| layer_index(video.layer) == li)
+    }
+
+    /// Stop one video layer now, or start its picture fade (the tick stops it
+    /// when the fade completes).
+    fn stop_video_layer(&mut self, li: usize, fade_out_secs: f32) {
+        if fade_out_secs > 0.0 {
+            self.video_control.lock_unpoisoned().layers[li].fade =
+                Some((Instant::now(), fade_out_secs));
+        } else {
+            self.stop_video_playback(li);
+        }
+    }
+
     fn stop_external_outputs(&mut self) {
-        self.mtc_follow = None;
+        for layer in &mut self.video_layers {
+            layer.mtc_follow = None;
+        }
         self.lighting.stop_fade();
         self.lighting.stop_all_shows();
         self.stop_pixmap();
@@ -1579,8 +1622,13 @@ impl App {
             } => {
                 self.ensure_outputs_and_canvas(event_loop);
                 let family = self.text_font_family(font);
-                let blank = self.current_video_qid.is_none()
-                    && !self.video_control.lock_unpoisoned().canvas_has_frame;
+                let blank = self.video_layers.iter().all(|layer| layer.qid.is_none())
+                    && !self
+                        .video_control
+                        .lock_unpoisoned()
+                        .layers
+                        .iter()
+                        .any(|stream| stream.canvas_has_frame);
                 if blank {
                     let _ = self.canvas_cmd_tx.send(CanvasCommand::BlankCanvas);
                 }
@@ -1612,17 +1660,12 @@ impl App {
             }
             cuepool_core::Cue::Image { path, fit, .. } => {
                 self.ensure_outputs_and_canvas(event_loop);
-                self.video_stop_flag.store(true, Ordering::Relaxed);
-                self.pending_video_decode = None;
-                {
-                    let mut control = self.video_control.lock_unpoisoned();
-                    control.stream_epoch += 1;
-                    control.clock = None;
-                    control.frame_rx = None;
-                    control.peek_pts = None;
-                    control.last_pts = None;
+                // A still takes the whole canvas: every video layer goes, and
+                // the still occupies layer 1's slot.
+                for li in 0..VIDEO_LAYERS {
+                    self.stop_video_playback(li);
                 }
-                self.set_current_video_qid(Some(qid));
+                self.set_current_video_qid(0, Some(qid));
                 let resolved = self.resolve_path(path).unwrap_or_else(|| path.clone());
                 let _ = self
                     .canvas_cmd_tx
@@ -1881,13 +1924,13 @@ impl App {
 
     /// Set the current video cue and mirror its presence to the consume thread
     /// (drives the published `has_content`).
-    fn set_current_video_qid(&mut self, qid: Option<rust_decimal::Decimal>) {
-        self.current_video_qid = qid;
+    fn set_current_video_qid(&mut self, li: usize, qid: Option<rust_decimal::Decimal>) {
+        self.video_layers[li].qid = qid;
         // The caller that starts a video assigns its new instance immediately
         // afterwards. Clearing here prevents an Image cue (which shares this
         // content slot) from inheriting a seekable video's runtime identity.
-        self.current_video_instance_id = None;
-        self.video_control.lock_unpoisoned().video_active = qid.is_some();
+        self.video_layers[li].instance_id = None;
+        self.video_control.lock_unpoisoned().layers[li].active = qid.is_some();
     }
 
     /// Set the current Text cue and mirror its presence to the consume thread.
@@ -2187,7 +2230,9 @@ impl App {
     fn rebuild_audio_engine(&mut self, driver: AudioOutputDriver, configured_device: &str) {
         let now = self.engine_now();
         let _ = self.show_engine.command(EngineCommand::Stop, now);
-        self.stop_video_playback();
+        for li in 0..VIDEO_LAYERS {
+            self.stop_video_playback(li);
+        }
         self.set_video_paused(false);
         self.stop_external_outputs();
         self.show_engine.replace_audio_engine(None);
@@ -2234,6 +2279,7 @@ impl App {
 
     fn seek_video_cue(
         &mut self,
+        li: usize,
         qid: rust_decimal::Decimal,
         path: &str,
         target_secs: f64,
@@ -2250,22 +2296,24 @@ impl App {
         };
         {
             let mut ctl = self.video_control.lock_unpoisoned();
-            ctl.clock = Some(clock);
-            ctl.pause_started = pause_started;
-            ctl.peek_pts = None;
-            ctl.last_pts = None;
-            ctl.timeline_offset_secs = media_offset_secs;
-            if ctl.hold_position.is_some() {
-                ctl.hold_position = Some(target_secs);
+            let stream = &mut ctl.layers[li];
+            stream.clock = Some(clock);
+            stream.pause_started = pause_started;
+            stream.peek_pts = None;
+            stream.last_pts = None;
+            stream.timeline_offset_secs = media_offset_secs;
+            if stream.hold_position.is_some() {
+                stream.hold_position = Some(target_secs);
             }
         }
-        if let Some(follow) = self.mtc_follow.as_mut()
+        if let Some(follow) = self.video_layers[li].mtc_follow.as_mut()
             && follow.qid == qid
             && follow.hold_position.is_some()
         {
             follow.hold_position = Some(target_secs);
         }
         self.spawn_video_decode(
+            li,
             path,
             Some(media_target_secs),
             paused.then_some(VideoSeekFrameRequest {
@@ -2280,19 +2328,22 @@ impl App {
     #[allow(clippy::too_many_arguments)] // Mirrors the PlayVideo engine action at the runtime boundary.
     fn play_video(
         &mut self,
+        li: usize,
         path: &str,
         qid: rust_decimal::Decimal,
         instance_id: u64,
         clock_origin: Duration,
         start_time: cuepool_core::Timespan,
         duration: cuepool_core::Timespan,
+        region: Option<cuepool_core::CanvasRect>,
         event_loop: &ActiveEventLoop,
     ) {
+        let layer = &mut self.video_layers[li];
         // A fresh cue gets a fresh retry budget.
-        self.video_open_retries = 0;
-        if self.hap_fallback_instance_id != Some(instance_id) {
-            self.hap_fallback_session = HapFallbackSession::default();
-            self.hap_fallback_instance_id = Some(instance_id);
+        layer.open_retries = 0;
+        if layer.hap_fallback_instance_id != Some(instance_id) {
+            layer.hap_fallback_session = HapFallbackSession::default();
+            layer.hap_fallback_instance_id = Some(instance_id);
         }
         // Only open output windows on the first video; looping should not respawn them.
         if self.output_windows.is_empty() {
@@ -2308,39 +2359,46 @@ impl App {
         };
         {
             let mut ctl = self.video_control.lock_unpoisoned();
-            ctl.stream_epoch += 1;
+            ctl.bump_epoch(li);
+            ctl.fit = projection.fit;
+            let stream = &mut ctl.layers[li];
             // Preserve the audio-master cue origin across output-window creation.
             // Frames late vs this clock are skipped, so decoder startup catches up
-            // without turning setup time into a permanent audio lead.
+            // without turning setup time into a permanent audio lead. Layers
+            // fired in one engine tick share `clock_origin`, so they stay in sync.
             let media_offset = start_time.as_secs_f64().max(0.0);
-            ctl.clock = video_start_clock(Instant::now(), media_offset, engine_now, clock_origin);
-            ctl.pause_started = None;
-            ctl.peek_pts = None;
-            ctl.last_pts = None;
-            ctl.canvas_has_frame = false;
-            ctl.media_length_secs =
+            stream.clock =
+                video_start_clock(Instant::now(), media_offset, engine_now, clock_origin);
+            stream.pause_started = None;
+            stream.peek_pts = None;
+            stream.last_pts = None;
+            // Not drawn until its first frame: the previous clip's last frame
+            // on this layer must not linger.
+            stream.canvas_has_frame = false;
+            stream.media_length_secs =
                 (duration.as_secs_f64() > 0.0).then(|| media_offset + duration.as_secs_f64());
-            ctl.timeline_offset_secs = media_offset;
+            stream.timeline_offset_secs = media_offset;
             // A new video always starts at full brightness, cancelling any
             // Stop-cue fade still in flight.
-            ctl.fade = None;
+            stream.fade = None;
             // A step-back aimed at the previous stream must not replay here
             // (the epoch gate no longer consumes it against a dead stream).
-            ctl.seek_frame = None;
-            ctl.fit = projection.fit;
+            stream.seek_frame = None;
+            stream.region = region;
         }
-        self.set_current_video_qid(Some(qid));
-        self.current_video_instance_id = Some(instance_id);
-        // (Re)create the consume thread's canvas at the projection size; `force`
-        // clears the previous clip's last frame even when the dims match.
+        self.set_current_video_qid(li, Some(qid));
+        self.video_layers[li].instance_id = Some(instance_id);
+        // (Re)create the consume thread's canvas if the projection size
+        // changed; the layer composite repaints it either way.
         let _ = self.canvas_cmd_tx.send(CanvasCommand::Resize {
             w: projection.canvas_width,
             h: projection.canvas_height,
-            force: true,
+            force: false,
         });
 
         let media_offset = start_time.as_secs_f64().max(0.0);
         self.spawn_video_decode(
+            li,
             path,
             (media_offset > 0.0).then_some(media_offset),
             None,
@@ -2355,42 +2413,45 @@ impl App {
     /// after the decoder opens; clock correction stays on the decode thread.
     fn spawn_video_decode(
         &mut self,
+        li: usize,
         path: &str,
         start_before: Option<f64>,
         seek_frame: Option<VideoSeekFrameRequest>,
         clamp_to_media: bool,
     ) {
         let path = self.resolve_path(path).unwrap_or_else(|| path.to_string());
+        let layer = &mut self.video_layers[li];
         queue_latest_video_decode(
-            &mut self.pending_video_decode,
+            &mut layer.pending_decode,
             VideoDecodeRequest {
                 path,
                 start_before,
                 seek_frame,
                 clamp_to_media,
-                hap_fallback_session: self.hap_fallback_session.clone(),
+                hap_fallback_session: layer.hap_fallback_session.clone(),
             },
         );
-        self.video_stop_flag.store(true, Ordering::Relaxed);
+        layer.stop_flag.store(true, Ordering::Relaxed);
         // Retire the old receiver immediately. If its FFmpeg open is slow to
         // cancel, the last picture stays held instead of old queued frames
         // being presented against the newly-seeked clock.
         {
             let mut ctl = self.video_control.lock_unpoisoned();
-            ctl.stream_epoch += 1;
-            ctl.frame_rx = None;
-            ctl.peek_pts = None;
+            ctl.bump_epoch(li);
+            ctl.layers[li].frame_rx = None;
+            ctl.layers[li].peek_pts = None;
         }
-        self.start_pending_video_decode();
+        self.start_pending_video_decode(li);
     }
 
-    fn start_pending_video_decode(&mut self) {
+    fn start_pending_video_decode(&mut self, li: usize) {
+        let layer = &mut self.video_layers[li];
         let Some(request) =
-            take_ready_video_decode(&mut self.video_decode_join, &mut self.pending_video_decode)
+            take_ready_video_decode(&mut layer.decode_join, &mut layer.pending_decode)
         else {
             return;
         };
-        self.video_stop_flag = Arc::new(AtomicBool::new(false));
+        layer.stop_flag = Arc::new(AtomicBool::new(false));
         let VideoDecodeRequest {
             path,
             start_before,
@@ -2409,13 +2470,14 @@ impl App {
         // peeked frame and invalidates EOF already queued by the old decoder.
         let stream_epoch = {
             let mut ctl = self.video_control.lock_unpoisoned();
-            ctl.stream_epoch += 1;
-            ctl.frame_rx = Some(frame_rx);
-            ctl.seek_frame = seek_frame;
-            ctl.timings = timings.clone();
-            ctl.stream_epoch
+            let epoch = ctl.bump_epoch(li);
+            let stream = &mut ctl.layers[li];
+            stream.frame_rx = Some(frame_rx);
+            stream.seek_frame = seek_frame;
+            stream.timings = timings.clone();
+            epoch
         };
-        let stop_flag = Arc::clone(&self.video_stop_flag);
+        let stop_flag = Arc::clone(&self.video_layers[li].stop_flag);
         let pause_flag = Arc::clone(&self.video_pause_flag);
         let frame_pool = Arc::clone(&self.frame_pool);
         let diag_state = Arc::clone(self.cuepool.state());
@@ -2434,6 +2496,7 @@ impl App {
                     frame_tx,
                     diag_state,
                     video_control,
+                    li,
                     stream_epoch,
                     clamp_to_media,
                     frame_pool,
@@ -2443,9 +2506,9 @@ impl App {
                     hap_fallback_session,
                 );
             }) {
-            Ok(join) => self.video_decode_join = Some(join),
+            Ok(join) => self.video_layers[li].decode_join = Some(join),
             Err(e) => {
-                self.video_control.lock_unpoisoned().frame_rx = None;
+                self.video_control.lock_unpoisoned().layers[li].frame_rx = None;
                 log::error!("Video cue degraded: could not spawn decode thread: {e}");
             }
         }
@@ -2478,27 +2541,35 @@ impl App {
     /// Stop video/image playback: signal the decode thread, drop the frame
     /// channel (its send fails with Disconnected and the thread exits), and
     /// clear presentation state so the next published frame goes black.
-    fn stop_video_playback(&mut self) {
-        self.video_stop_flag.store(true, Ordering::Relaxed);
-        self.pending_video_decode = None;
-        self.hap_fallback_session = HapFallbackSession::default();
-        self.hap_fallback_instance_id = None;
+    fn stop_video_playback(&mut self, li: usize) {
+        let layer = &mut self.video_layers[li];
+        layer.stop_flag.store(true, Ordering::Relaxed);
+        layer.pending_decode = None;
+        layer.hap_fallback_session = HapFallbackSession::default();
+        layer.hap_fallback_instance_id = None;
+        layer.mtc_follow = None;
+        let was_playing = layer.qid.is_some();
         {
             let mut ctl = self.video_control.lock_unpoisoned();
-            ctl.stream_epoch += 1;
-            ctl.frame_rx = None;
-            ctl.clock = None;
-            ctl.peek_pts = None;
-            ctl.last_pts = None;
-            ctl.canvas_has_frame = false;
-            ctl.fade = None;
-            ctl.hold_position = None;
-            ctl.seek_frame = None;
-            ctl.media_length_secs = None;
-            ctl.timeline_offset_secs = 0.0;
+            ctl.bump_epoch(li);
+            let stream = &mut ctl.layers[li];
+            stream.frame_rx = None;
+            stream.clock = None;
+            stream.peek_pts = None;
+            stream.last_pts = None;
+            stream.canvas_has_frame = false;
+            stream.fade = None;
+            stream.hold_position = None;
+            stream.seek_frame = None;
+            stream.media_length_secs = None;
+            stream.timeline_offset_secs = 0.0;
         }
-        self.set_current_video_qid(None);
-        self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
+        self.set_current_video_qid(li, None);
+        // ponytail: diagnostics show one stream; clear them when any layer that
+        // was playing stops (per-layer diagnostics are out of scope).
+        if was_playing {
+            self.cuepool.state().lock_unpoisoned().diagnostics.video = None;
+        }
     }
 
     /// Whether a quit right now has to go through the confirm modal first.
@@ -2536,13 +2607,18 @@ impl App {
     /// position math while paused must anchor on `pause_started`.
     /// While an MTC-follow cue is holding (MTC stopped), the hold position
     /// wins over the wall clock — the MTC master owns the position.
-    fn video_paused_position(&self) -> Option<Duration> {
-        if let Some(h) = self.mtc_follow.as_ref().and_then(|f| f.hold_position) {
+    fn video_paused_position(&self, li: usize) -> Option<Duration> {
+        if let Some(h) = self.video_layers[li]
+            .mtc_follow
+            .as_ref()
+            .and_then(|f| f.hold_position)
+        {
             return Some(Duration::from_secs_f64(h.max(0.0)));
         }
         let ctl = self.video_control.lock_unpoisoned();
-        let clock = ctl.clock?;
-        Some(match ctl.pause_started {
+        let stream = &ctl.layers[li];
+        let clock = stream.clock?;
+        Some(match stream.pause_started {
             Some(paused_at) => paused_at.duration_since(clock),
             None => clock.elapsed(),
         })
@@ -2550,9 +2626,11 @@ impl App {
 
     /// Shift the video position by `delta_secs` (pure presentation-clock slew;
     /// the decoder is untouched). Positive = further into the clip.
-    fn nudge_video_clock(&mut self, delta_secs: f64) {
+    fn nudge_video_clock(&mut self, li: usize, delta_secs: f64) {
         let mut ctl = self.video_control.lock_unpoisoned();
-        let Some(c) = ctl.clock.as_mut() else { return };
+        let Some(c) = ctl.layers[li].clock.as_mut() else {
+            return;
+        };
         if delta_secs >= 0.0 {
             if let Some(shifted) = c.checked_sub(Duration::from_secs_f64(delta_secs)) {
                 *c = shifted;
@@ -2563,9 +2641,9 @@ impl App {
     }
 
     /// Re-anchor the playback clock so the current position is exactly `target`.
-    fn mtc_reanchor(&mut self, target: f64) {
+    fn mtc_reanchor(&mut self, li: usize, target: f64) {
         if let Some(c) = Instant::now().checked_sub(Duration::from_secs_f64(target.max(0.0))) {
-            self.video_control.lock_unpoisoned().clock = Some(c);
+            self.video_control.lock_unpoisoned().layers[li].clock = Some(c);
         }
     }
 
@@ -2582,34 +2660,53 @@ impl App {
     /// syncs to the *then* current target, so scrub bursts coalesce to the
     /// latest position instead of replaying every intermediate one.
     /// Returns whether the reopen actually happened.
-    fn mtc_hard_sync(&mut self, target: f64) -> bool {
-        let Some(follow) = self.mtc_follow.as_ref() else {
+    fn mtc_hard_sync(&mut self, li: usize, target: f64) -> bool {
+        let layer = &mut self.video_layers[li];
+        let Some(follow) = layer.mtc_follow.as_ref() else {
             return false;
         };
-        if self
+        if layer
             .last_hard_sync
             .is_some_and(|at| at.elapsed() < mtc_follow::HARD_SYNC_REOPEN_FLOOR)
         {
             log::trace!("[MTC] Hard sync to {target:.2}s coalesced");
             return false;
         }
-        self.last_hard_sync = Some(Instant::now());
+        layer.last_hard_sync = Some(Instant::now());
         let path = follow.path.clone();
         log::info!("[MTC] Hard sync Q{} to {:.2}s", follow.qid, target);
         // Clamp: the timecode source is free to run past the end of the clip
         // (a short insert against a full-length show track), and an unclamped
         // seek past the media just puts the demuxer off the end. SeekCue and
         // the automation API already clamp; this path was the outlier.
-        self.spawn_video_decode(&path, Some(target), None, true);
-        self.mtc_reanchor(target);
+        self.spawn_video_decode(li, &path, Some(target), None, true);
+        self.mtc_reanchor(li, target);
         true
     }
 
-    /// Drive the timecode-follow cue from the latest source state. No-op
-    /// without one.
+    /// Drive every timecode-follow layer from the latest source state.
     fn drive_mtc_follow(&mut self, mtc: &TimecodeState) {
         self.mtc_drift = None;
-        let Some(follow) = self.mtc_follow.as_mut() else {
+        // Warn (once per rate change) if the MTC fps isn't the expected 25.
+        if mtc.running
+            && mtc.position.frame_rate != MtcFrameRate::Fps25
+            && self.mtc_warned_fps != Some(mtc.position.frame_rate)
+        {
+            self.mtc_warned_fps = Some(mtc.position.frame_rate);
+            log::warn!(
+                "[MTC] Source is {}, expected 25fps — video sync may drift",
+                mtc.position.frame_rate.name()
+            );
+        }
+
+        for li in 0..VIDEO_LAYERS {
+            self.drive_mtc_follow_layer(li, mtc);
+        }
+    }
+
+    /// Drive one layer's timecode-follow cue. No-op without one.
+    fn drive_mtc_follow_layer(&mut self, li: usize, mtc: &TimecodeState) {
+        let Some(follow) = self.video_layers[li].mtc_follow.as_mut() else {
             return;
         };
         let offset_secs = follow.offset_secs;
@@ -2636,20 +2733,8 @@ impl App {
         // Locates before the start offset clamp to frame 0 (and hold there).
         let target = (extrapolated - offset_secs).max(0.0);
 
-        // Warn (once per rate change) if the MTC fps isn't the expected 25.
-        if mtc.running
-            && mtc.position.frame_rate != MtcFrameRate::Fps25
-            && self.mtc_warned_fps != Some(mtc.position.frame_rate)
-        {
-            self.mtc_warned_fps = Some(mtc.position.frame_rate);
-            log::warn!(
-                "[MTC] Source is {}, expected 25fps — video sync may drift",
-                mtc.position.frame_rate.name()
-            );
-        }
-
         let current = self
-            .video_paused_position()
+            .video_paused_position(li)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
@@ -2658,40 +2743,41 @@ impl App {
                 // Stopped→playing transition: jump if far off, else re-anchor
                 // so the position continues smoothly from the target.
                 if (target - h).abs() > mtc_follow::HARD_SYNC_SECS {
-                    self.mtc_hard_sync(target);
+                    self.mtc_hard_sync(li, target);
                 } else {
-                    self.mtc_reanchor(target);
+                    self.mtc_reanchor(li, target);
                 }
             } else {
                 let drift = target - current;
-                self.mtc_drift = Some(drift);
+                // The GUI shows one drift: the lowest following layer's.
+                self.mtc_drift.get_or_insert(drift);
                 match mtc_follow::drift_action(drift, dt) {
-                    mtc_follow::MtcAdjust::Nudge(d) => self.nudge_video_clock(d),
+                    mtc_follow::MtcAdjust::Nudge(d) => self.nudge_video_clock(li, d),
                     mtc_follow::MtcAdjust::HardSync => {
-                        self.mtc_hard_sync(target);
+                        self.mtc_hard_sync(li, target);
                     }
                     mtc_follow::MtcAdjust::None | mtc_follow::MtcAdjust::Hold => {}
                 }
             }
-            if let Some(f) = self.mtc_follow.as_mut() {
+            if let Some(f) = self.video_layers[li].mtc_follow.as_mut() {
                 f.hold_position = None;
             }
-            self.video_control.lock_unpoisoned().hold_position = None;
+            self.video_control.lock_unpoisoned().layers[li].hold_position = None;
         } else {
             // Running-but-not-playing (full-frame locate) or fully stopped:
             // snap to the target if off, then freeze there.
-            let may_reopen = self
+            let may_reopen = self.video_layers[li]
                 .last_hard_sync
                 .is_none_or(|at| at.elapsed() >= mtc_follow::HARD_SYNC_REOPEN_FLOOR);
             let action = mtc_follow::locate_action(target - current, may_reopen);
             if action.sync {
-                self.mtc_hard_sync(target);
+                self.mtc_hard_sync(li, target);
             }
             if action.hold {
-                if let Some(f) = self.mtc_follow.as_mut() {
+                if let Some(f) = self.video_layers[li].mtc_follow.as_mut() {
                     f.hold_position = Some(target);
                 }
-                self.video_control.lock_unpoisoned().hold_position = Some(target);
+                self.video_control.lock_unpoisoned().layers[li].hold_position = Some(target);
             }
         }
     }
@@ -2703,36 +2789,44 @@ impl App {
             return;
         }
         let mut ctl = self.video_control.lock_unpoisoned();
-        if ctl.clock.is_some() {
+        // The lowest live layer leads; every live layer steps by its delta so
+        // side-by-side layers stay in lockstep.
+        if let Some(lead) = ctl.layers.iter().position(|stream| stream.clock.is_some()) {
             // The next frame's PTS comes from the consume thread's peek mirror
             // (it owns the channel now). Right after a pause the peek may not
             // be filled yet — the step just works on the next keypress.
             // Position math is inlined from the guard: `video_paused_position`
             // would re-lock this same mutex (non-reentrant).
-            let pos = ctl
+            let stream = &ctl.layers[lead];
+            let pos = stream
                 .hold_position
                 .map(|h| Duration::from_secs_f64(h.max(0.0)))
                 .or_else(|| {
-                    ctl.clock.map(|c| match ctl.pause_started {
+                    stream.clock.map(|c| match stream.pause_started {
                         Some(p) => p.duration_since(c),
                         None => c.elapsed(),
                     })
                 })
                 .unwrap_or_default()
                 .as_secs_f64();
-            if let Some(f_pts) = ctl.peek_pts {
+            if let Some(f_pts) = stream.peek_pts {
                 let delta = f_pts - pos;
-                if delta > 0.0 {
+                let mut shifted = false;
+                for stream in ctl.layers.iter_mut().filter(|s| s.clock.is_some()) {
                     // Moving the clock's epoch back makes the next frame due.
-                    if let Some(c) = ctl
-                        .clock
-                        .and_then(|c| c.checked_sub(Duration::from_secs_f64(delta)))
+                    if delta > 0.0
+                        && let Some(c) = stream
+                            .clock
+                            .and_then(|c| c.checked_sub(Duration::from_secs_f64(delta)))
                     {
-                        ctl.clock = Some(c);
-                        self.show_engine.adjust_show_time(delta);
+                        stream.clock = Some(c);
+                        shifted = true;
                     }
+                    stream.step_pending = true;
                 }
-                ctl.step_pending = true;
+                if shifted {
+                    self.show_engine.adjust_show_time(delta);
+                }
                 return;
             }
             log::debug!("Frame step: no decoded frame available yet");
@@ -2758,44 +2852,16 @@ impl App {
         if !self.paused {
             return;
         }
-        let has_clock = self.video_control.lock_unpoisoned().clock.is_some();
-        if has_clock {
-            let pos = self
-                .video_paused_position()
-                .unwrap_or_default()
-                .as_secs_f64();
-            let cur = self.video_control.lock_unpoisoned().last_pts.unwrap_or(pos);
-            if cur <= 0.0 {
-                return;
+        let live = {
+            let ctl = self.video_control.lock_unpoisoned();
+            (0..VIDEO_LAYERS)
+                .filter(|&li| ctl.layers[li].clock.is_some())
+                .collect::<Vec<_>>()
+        };
+        if !live.is_empty() {
+            for li in live {
+                self.frame_step_back_layer(li);
             }
-            let path = {
-                let Ok(state) = self.cuepool.state().lock() else {
-                    return;
-                };
-                let Some(qid) = self.current_video_qid else {
-                    return;
-                };
-                let Some(path) = state.show_file.cues.iter().find_map(|c| match c {
-                    cuepool_core::Cue::Video { path, .. } if c.base().qid == qid => {
-                        Some(path.clone())
-                    }
-                    _ => None,
-                }) else {
-                    return;
-                };
-                path
-            };
-            // The consume thread does the (blocking) wait for the sought frame,
-            // snaps the clock, and reports the delta back for the show clock.
-            self.spawn_video_decode(
-                &path,
-                Some(cur),
-                Some(VideoSeekFrameRequest {
-                    position: pos,
-                    adjust_show_clock: true,
-                }),
-                false,
-            );
             return;
         }
         // No video: rewind the frozen clock by one display frame.
@@ -2806,6 +2872,49 @@ impl App {
             state.show_file.show_settings.timecode_fps.max(1.0)
         };
         self.show_engine.adjust_show_time(-1.0 / fps as f64);
+    }
+
+    /// Re-seek one layer to just before its current frame. Each layer snaps
+    /// its own clock; the tick folds one of the reported deltas into the
+    /// show clock.
+    fn frame_step_back_layer(&mut self, li: usize) {
+        let pos = self
+            .video_paused_position(li)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let cur = self.video_control.lock_unpoisoned().layers[li]
+            .last_pts
+            .unwrap_or(pos);
+        if cur <= 0.0 {
+            return;
+        }
+        let path = {
+            let Ok(state) = self.cuepool.state().lock() else {
+                return;
+            };
+            let Some(qid) = self.video_layers[li].qid else {
+                return;
+            };
+            let Some(path) = state.show_file.cues.iter().find_map(|c| match c {
+                cuepool_core::Cue::Video { path, .. } if c.base().qid == qid => Some(path.clone()),
+                _ => None,
+            }) else {
+                return;
+            };
+            path
+        };
+        // The consume thread does the (blocking) wait for the sought frame,
+        // snaps the clock, and reports the delta back for the show clock.
+        self.spawn_video_decode(
+            li,
+            &path,
+            Some(cur),
+            Some(VideoSeekFrameRequest {
+                position: pos,
+                adjust_show_clock: true,
+            }),
+            false,
+        );
     }
 
     fn handle_dropped_file(&mut self, path: &Path) {
@@ -2871,6 +2980,8 @@ impl App {
                     routing: cuepool_core::AudioRouting::default(),
                     follow_mtc: false,
                     mtc_start: cuepool_core::Timespan::from_secs_f64(3600.0),
+                    layer: cuepool_core::cue::default_video_layer(),
+                    region: None,
                 }
             } else {
                 cuepool_core::Cue::Sound {
@@ -3029,9 +3140,9 @@ impl App {
                     .iter()
                     .any(|cue| cue.instance_id == instance_id)
                     || snapshot
-                        .video
-                        .as_ref()
-                        .is_some_and(|video| video.instance_id == instance_id);
+                        .videos
+                        .iter()
+                        .any(|video| video.instance_id == instance_id);
                 if !found {
                     return Err(format!("cue instance {instance_id} is not active"));
                 }
@@ -3067,12 +3178,12 @@ impl App {
         let engine = self.show_engine.snapshot();
         !engine.active_cues.is_empty()
             || engine.show_elapsed_secs.is_some()
-            || engine.video.is_some()
-            || self.current_video_qid.is_some()
+            || !engine.videos.is_empty()
+            || self.video_layers.iter().any(|layer| {
+                layer.qid.is_some() || layer.pending_decode.is_some() || layer.mtc_follow.is_some()
+            })
             || self.current_text_qid.is_some()
-            || self.pending_video_decode.is_some()
             || self.current_pixmap_qid.is_some()
-            || self.mtc_follow.is_some()
             || self.recorder.recording()
             || self.lighting.is_active()
     }
@@ -3871,7 +3982,9 @@ impl App {
     /// their last frame with the GUI hidden because the loop-restart poll
     /// below never ran until the GUI was focused again.
     fn tick_engine(&mut self, event_loop: &ActiveEventLoop) {
-        self.start_pending_video_decode();
+        for li in 0..VIDEO_LAYERS {
+            self.start_pending_video_decode(li);
+        }
         self.process_commands(event_loop);
         let now = self.engine_now();
         let actions = self.show_engine.tick(now);
@@ -3917,45 +4030,60 @@ impl App {
             })
             .collect();
 
-        let (video_paused, video_position, video_length) = {
+        // One entry per occupied video layer: (qid, instance, paused, position, length).
+        let layer_videos = {
             let control = self.video_control.lock_unpoisoned();
-            let media_position = match (control.clock, control.pause_started) {
-                (Some(clock), Some(paused_at)) => paused_at.duration_since(clock).as_secs_f64(),
-                (Some(clock), None) => clock.elapsed().as_secs_f64(),
-                _ => 0.0,
-            };
-            (
-                control.pause_started.is_some(),
-                video_timeline_secs(media_position, control.timeline_offset_secs) as f32,
-                control
-                    .media_length_secs
-                    .map(|length| video_timeline_secs(length, control.timeline_offset_secs) as f32),
-            )
+            (0..VIDEO_LAYERS)
+                .filter_map(|li| {
+                    let engine_video = engine_snapshot
+                        .videos
+                        .iter()
+                        .find(|video| layer_index(video.layer) == li);
+                    let qid = engine_video
+                        .map(|video| video.qid)
+                        .or(self.video_layers[li].qid)?;
+                    let stream = &control.layers[li];
+                    let media_position = match (stream.clock, stream.pause_started) {
+                        (Some(clock), Some(paused_at)) => {
+                            paused_at.duration_since(clock).as_secs_f64()
+                        }
+                        (Some(clock), None) => clock.elapsed().as_secs_f64(),
+                        _ => 0.0,
+                    };
+                    Some((
+                        qid,
+                        engine_video
+                            .map(|video| video.instance_id)
+                            .unwrap_or_default(),
+                        stream.pause_started.is_some(),
+                        video_timeline_secs(media_position, stream.timeline_offset_secs) as f32,
+                        stream.media_length_secs.map(|length| {
+                            video_timeline_secs(length, stream.timeline_offset_secs) as f32
+                        }),
+                    ))
+                })
+                .collect::<Vec<_>>()
         };
 
         if let Ok(mut state) = self.cuepool.state().lock() {
-            if let Some(qid) = engine_snapshot
-                .video
-                .as_ref()
-                .map(|video| video.qid)
-                .or(self.current_video_qid)
-                && !published.iter().any(|cue| cue.qid == qid)
-                && let Some(cue) = state
+            for (qid, instance_id, video_paused, video_position, video_length) in layer_videos {
+                if published.iter().any(|cue| cue.qid == qid) {
+                    continue;
+                }
+                let Some(cue) = state
                     .show_file
                     .cues
                     .iter()
                     .find(|cue| cue.base().qid == qid)
-            {
+                else {
+                    continue;
+                };
                 let configured_duration = match cue {
                     cuepool_core::Cue::Video { duration, .. } => duration.as_secs_f64() as f32,
                     _ => 0.0,
                 };
                 published.push(cuepool_gui::ActiveCueInfo {
-                    instance_id: engine_snapshot
-                        .video
-                        .as_ref()
-                        .map(|video| video.instance_id)
-                        .unwrap_or_default(),
+                    instance_id,
                     qid,
                     name: cue.base().name.clone(),
                     paused: video_paused,
@@ -4215,14 +4343,14 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
         match event {
-            AppEvent::VideoEof(epoch) => {
-                let current_epoch = self.video_control.lock_unpoisoned().stream_epoch;
+            AppEvent::VideoEof { layer: li, epoch } => {
+                let current_epoch = self.video_control.lock_unpoisoned().layers[li].stream_epoch;
                 if epoch != current_epoch {
                     log::debug!("Ignoring stale video EOF epoch {epoch} (current {current_epoch})");
                     return;
                 }
-                log::info!("Video EOF");
-                if let Some(video) = self.show_engine.snapshot().video {
+                log::info!("Video EOF (layer {})", li + 1);
+                if let Some(video) = self.engine_video_on_layer(li) {
                     let now = self.engine_now();
                     let actions = self.show_engine.event(
                         EngineEvent::VideoEof {
@@ -4236,8 +4364,8 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 }
             }
-            AppEvent::VideoFailed(epoch) => {
-                let current_epoch = self.video_control.lock_unpoisoned().stream_epoch;
+            AppEvent::VideoFailed { layer: li, epoch } => {
+                let current_epoch = self.video_control.lock_unpoisoned().layers[li].stream_epoch;
                 if epoch != current_epoch {
                     log::debug!(
                         "Ignoring stale video failure epoch {epoch} (current {current_epoch})"
@@ -4249,22 +4377,22 @@ impl ApplicationHandler<AppEvent> for App {
                 // from the current position before giving the cue up. A
                 // genuinely damaged file exhausts the budget in a few fast
                 // attempts and reports.
-                if let Some(video) = self.show_engine.snapshot().video
-                    && self.video_open_retries < MAX_VIDEO_OPEN_RETRIES
+                if let Some(video) = self.engine_video_on_layer(li)
+                    && self.video_layers[li].open_retries < MAX_VIDEO_OPEN_RETRIES
                 {
-                    self.video_open_retries += 1;
-                    let attempt = self.video_open_retries;
+                    self.video_layers[li].open_retries += 1;
+                    let attempt = self.video_layers[li].open_retries;
                     log::warn!(
                         "Video decoder failed on '{}'; retrying from {:.2}s ({attempt}/{MAX_VIDEO_OPEN_RETRIES})",
                         video.path,
                         video.position_secs
                     );
                     let path = video.path.clone();
-                    self.spawn_video_decode(&path, Some(video.position_secs), None, false);
+                    self.spawn_video_decode(li, &path, Some(video.position_secs), None, false);
                     return;
                 }
                 log::error!("Video decoder failed; stopping the current picture without looping");
-                if let Some(video) = self.show_engine.snapshot().video {
+                if let Some(video) = self.engine_video_on_layer(li) {
                     // The operator needs this on screen, not only in the log:
                     // the visible symptom is a picture that stops for no
                     // stated reason, which reads as the show being broken.
@@ -4924,8 +5052,19 @@ impl ApplicationHandler<AppEvent> for App {
         // (Decode consumption, canvas upload and the frame-state publish all
         // live on the consume thread — no GPU work happens on this thread.)
         {
-            let (fit, outputs_changed) = {
+            let (fit, outputs_changed, regions) = {
                 let state = self.cuepool.state().lock_unpoisoned();
+                // Live region edits: each playing layer follows its cue.
+                let regions = self.video_layers.each_ref().map(|layer| {
+                    layer.qid.and_then(|qid| {
+                        state.show_file.cues.iter().find_map(|cue| match cue {
+                            cuepool_core::Cue::Video { region, .. } if cue.base().qid == qid => {
+                                Some(*region)
+                            }
+                            _ => None,
+                        })
+                    })
+                });
                 let live = &state.show_file.projection;
                 let changed = if live.outputs != self.published_outputs {
                     self.published_outputs = live.outputs.clone();
@@ -4933,10 +5072,15 @@ impl ApplicationHandler<AppEvent> for App {
                 } else {
                     None
                 };
-                (live.fit, changed)
+                (live.fit, changed, regions)
             };
             let mut ctl = self.video_control.lock_unpoisoned();
             ctl.fit = fit;
+            for (stream, region) in ctl.layers.iter_mut().zip(regions) {
+                if let Some(region) = region {
+                    stream.region = region;
+                }
+            }
             if let Some(outputs) = outputs_changed {
                 ctl.outputs = outputs;
                 ctl.outputs_gen += 1;
@@ -4944,15 +5088,27 @@ impl ApplicationHandler<AppEvent> for App {
             ctl.identify = self
                 .identify_until
                 .is_some_and(|t| std::time::Instant::now() < t);
-            if let Some(delta) = ctl.seek_show_delta.take() {
+            // A step-back moves every live layer by one frame; each reports
+            // its delta, and the show clock takes one of them.
+            let deltas = ctl
+                .layers
+                .iter_mut()
+                .filter_map(|stream| stream.seek_show_delta.take())
+                .collect::<Vec<_>>();
+            if let Some(delta) = deltas.first() {
                 self.show_engine.adjust_show_time(-delta);
             }
-            let fade_done = ctl.fade.is_some_and(|(start, dur)| {
-                fade_elapsed(start, ctl.pause_started).as_secs_f32() >= dur
-            });
+            let faded = (0..VIDEO_LAYERS)
+                .filter(|&li| {
+                    let stream = &ctl.layers[li];
+                    stream.fade.is_some_and(|(start, dur)| {
+                        fade_elapsed(start, stream.pause_started).as_secs_f32() >= dur
+                    })
+                })
+                .collect::<Vec<_>>();
             drop(ctl);
-            if fade_done {
-                self.stop_video_playback();
+            for li in faded {
+                self.stop_video_playback(li);
             }
         }
 
@@ -5621,10 +5777,12 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
 
     // Graceful exit (never reached via hard_exit, which process::exit()s):
     // stop and join the consume thread like the render threads.
-    app.video_stop_flag.store(true, Ordering::Relaxed);
-    app.pending_video_decode = None;
-    if let Some(join) = app.video_decode_join.take() {
-        let _ = join.join();
+    for layer in &mut app.video_layers {
+        layer.stop_flag.store(true, Ordering::Relaxed);
+        layer.pending_decode = None;
+        if let Some(join) = layer.decode_join.take() {
+            let _ = join.join();
+        }
     }
     app.consume_stop.store(true, Ordering::Relaxed);
     if let Some(join) = app.consume_join.take() {

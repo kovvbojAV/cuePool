@@ -148,6 +148,40 @@ fn default_canvas_height() -> u32 {
     1080
 }
 
+/// A rectangle on the canvas, in pixels (a video layer's region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CanvasRect {
+    pub fn full(canvas_width: u32, canvas_height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: canvas_width,
+            height: canvas_height,
+        }
+    }
+
+    /// Clip to the canvas, keeping at least one pixel so a GPU target can
+    /// always be allocated for it.
+    pub fn clamped(self, canvas_width: u32, canvas_height: u32) -> Self {
+        let (cw, ch) = (canvas_width.max(1), canvas_height.max(1));
+        let x = self.x.min(cw - 1);
+        let y = self.y.min(ch - 1);
+        Self {
+            x,
+            y,
+            width: self.width.clamp(1, cw - x),
+            height: self.height.clamp(1, ch - y),
+        }
+    }
+}
+
 /// One projector output window sampling a rectangle from the canvas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectorOutput {
@@ -455,6 +489,41 @@ fn default_gamma() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_rect_clamps_into_the_canvas() {
+        let rect = CanvasRect {
+            x: 1800,
+            y: 0,
+            width: 960,
+            height: 2000,
+        };
+        assert_eq!(
+            rect.clamped(1920, 1080),
+            CanvasRect {
+                x: 1800,
+                y: 0,
+                width: 120,
+                height: 1080
+            }
+        );
+        // Off-canvas or empty regions still keep one pixel.
+        let off = CanvasRect {
+            x: 5000,
+            y: 5000,
+            width: 0,
+            height: 0,
+        };
+        assert_eq!(
+            off.clamped(1920, 1080),
+            CanvasRect {
+                x: 1919,
+                y: 1079,
+                width: 1,
+                height: 1
+            }
+        );
+    }
 
     #[test]
     fn test_default_config() {

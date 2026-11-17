@@ -6,7 +6,7 @@ use cuepool_harness::{HeadlessShowRunner, RunnerTrace};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::fs;
-use support::{Fixture, base, dummy, hap_video, sound, video};
+use support::{Fixture, base, dummy, hap_video, layered_video, sound, video};
 
 fn started(trace: &[RunnerTrace]) -> Vec<i64> {
     trace
@@ -504,7 +504,7 @@ fn video_seek_resets_pending_frames_and_preserves_pause() {
     runner.select(Decimal::ONE).unwrap();
     runner.go().unwrap();
     runner.advance_blocks(1).unwrap();
-    let instance = runner.snapshot().video.as_ref().unwrap().instance_id;
+    let instance = runner.snapshot().videos[0].instance_id;
     runner.take_trace();
 
     runner.seek(instance, 0.12).unwrap();
@@ -529,7 +529,7 @@ fn video_seek_resets_pending_frames_and_preserves_pause() {
     runner.advance_blocks(5).unwrap();
     assert!(video_pts(&runner.take_trace()).is_empty());
     assert!(runner.snapshot().paused);
-    assert!(runner.snapshot().video.as_ref().unwrap().paused);
+    assert!(runner.snapshot().videos[0].paused);
 
     runner.resume().unwrap();
     runner.advance_blocks(1).unwrap();
@@ -538,7 +538,7 @@ fn video_seek_resets_pending_frames_and_preserves_pause() {
     runner.pause().unwrap();
     runner.seek(instance, f32::INFINITY).unwrap();
     let snapshot = runner.snapshot();
-    assert!(snapshot.video.as_ref().unwrap().position_secs < 0.2);
+    assert!(snapshot.videos[0].position_secs < 0.2);
     assert!(runner.take_trace().iter().any(|entry| matches!(
         entry,
         RunnerTrace::VideoSeek { target_secs, .. }
@@ -555,7 +555,7 @@ fn hap_q_uses_the_production_decoder_for_pts_seek_pause_and_eof() {
     runner.advance_blocks(3).unwrap();
     assert_eq!(video_pts(&runner.take_trace()), vec![0.0, 0.02]);
 
-    let instance = runner.snapshot().video.as_ref().unwrap().instance_id;
+    let instance = runner.snapshot().videos[0].instance_id;
     runner.pause().unwrap();
     runner.seek(instance, 0.04).unwrap();
     runner.advance_blocks(5).unwrap();
@@ -565,7 +565,7 @@ fn hap_q_uses_the_production_decoder_for_pts_seek_pause_and_eof() {
     assert_eq!(video_pts(&runner.take_trace()), vec![0.04]);
 
     runner.advance_blocks(20).unwrap();
-    assert!(runner.snapshot().video.is_none());
+    assert!(runner.snapshot().videos.is_empty());
 }
 
 #[test]
@@ -598,14 +598,14 @@ fn video_eof_modes_stop_hold_and_reopen_without_stale_epochs() {
     runner.select(Decimal::ONE).unwrap();
     runner.go().unwrap();
     runner.advance_blocks(20).unwrap();
-    assert!(runner.snapshot().video.is_none());
+    assert!(runner.snapshot().videos.is_empty());
 
     let hold = Fixture::new(vec![video(1, LoopMode::HoldLast)]).unwrap();
     let mut runner = HeadlessShowRunner::open(&hold.project).unwrap();
     runner.select(Decimal::ONE).unwrap();
     runner.go().unwrap();
     runner.advance_blocks(20).unwrap();
-    assert!(runner.snapshot().video.is_some());
+    assert!(!runner.snapshot().videos.is_empty());
     assert_eq!(video_pts(&runner.take_trace()).last().copied(), Some(0.16));
 
     let looping = Fixture::new(vec![video(1, LoopMode::LoopedInfinite)]).unwrap();
@@ -623,7 +623,7 @@ fn video_eof_modes_stop_hold_and_reopen_without_stale_epochs() {
         })
         .collect();
     assert_eq!(eof_epochs, vec![1]);
-    assert_eq!(runner.snapshot().video.as_ref().unwrap().epoch, 2);
+    assert_eq!(runner.snapshot().videos[0].epoch, 2);
     assert!(
         trace
             .iter()
@@ -645,7 +645,7 @@ fn stop_and_project_replacement_clear_runtime_state() {
     runner.stop().unwrap();
     let snapshot = runner.snapshot();
     assert!(snapshot.active_cues.is_empty());
-    assert!(snapshot.video.is_none());
+    assert!(snapshot.videos.is_empty());
     assert!(!snapshot.paused);
 
     runner.select(Decimal::ONE).unwrap();
@@ -656,4 +656,94 @@ fn stop_and_project_replacement_clear_runtime_state() {
     assert!(!started(&runner.take_trace()).contains(&2));
     assert!(runner.snapshot().active_cues.is_empty());
     assert_eq!(runner.snapshot().standby_qid, None);
+}
+
+/// (layer, pts) of every frame in a trace.
+fn layered_pts(trace: &[RunnerTrace]) -> Vec<(u8, f64)> {
+    trace
+        .iter()
+        .filter_map(|entry| match entry {
+            RunnerTrace::VideoFrame { layer, pts, .. } => Some((*layer, *pts)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn with_last_videos_on_two_layers_present_the_same_frames_together() {
+    let fixture = Fixture::new(vec![
+        layered_video(1, 1, TriggerMode::Go, LoopMode::OneShot),
+        layered_video(2, 2, TriggerMode::WithLast, LoopMode::OneShot),
+        dummy(3, TriggerMode::AfterLast),
+    ])
+    .unwrap();
+    let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+    runner.select(Decimal::ONE).unwrap();
+    runner.go().unwrap();
+    assert_eq!(
+        runner
+            .snapshot()
+            .videos
+            .iter()
+            .map(|video| video.layer)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    let mut presented = 0;
+    let mut trace = Vec::new();
+    for _ in 0..30 {
+        runner.advance_blocks(1).unwrap();
+        let block = runner.take_trace();
+        let frames = layered_pts(&block);
+        trace.extend(block);
+        let left: Vec<f64> = frames.iter().filter(|f| f.0 == 1).map(|f| f.1).collect();
+        let right: Vec<f64> = frames.iter().filter(|f| f.0 == 2).map(|f| f.1).collect();
+        assert_eq!(
+            left, right,
+            "layers presented different frames in one block"
+        );
+        presented += left.len();
+    }
+    assert_eq!(presented, 5, "every frame of both clips was presented");
+    assert!(runner.snapshot().videos.is_empty());
+    assert_eq!(
+        started(&trace).iter().filter(|qid| **qid == 3).count(),
+        1,
+        "the AfterLast follow fires once"
+    );
+}
+
+#[test]
+fn stopping_one_video_layer_keeps_the_other_presenting() {
+    let stop = cuepool_core::Cue::Stop {
+        base: base(3, TriggerMode::Go),
+        stop_qid: Decimal::TWO,
+        stop_mode: cuepool_core::StopMode::Immediate,
+        fade_out_time: 0.0,
+        fade_type: Default::default(),
+        stop_all: false,
+    };
+    let fixture = Fixture::new(vec![
+        layered_video(1, 1, TriggerMode::Go, LoopMode::HoldLast),
+        layered_video(2, 2, TriggerMode::WithLast, LoopMode::HoldLast),
+        stop,
+    ])
+    .unwrap();
+    let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+    runner.select(Decimal::ONE).unwrap();
+    runner.go().unwrap();
+    runner.advance_blocks(2).unwrap();
+    runner.take_trace();
+
+    runner.go().unwrap();
+    assert_eq!(runner.snapshot().videos.len(), 1);
+    assert_eq!(runner.snapshot().videos[0].layer, 1);
+    runner.advance_blocks(10).unwrap();
+    let layers: Vec<u8> = layered_pts(&runner.take_trace())
+        .iter()
+        .map(|frame| frame.0)
+        .collect();
+    assert!(!layers.is_empty(), "layer 1 kept presenting");
+    assert!(layers.iter().all(|layer| *layer == 1));
 }

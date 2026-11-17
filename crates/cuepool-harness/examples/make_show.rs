@@ -36,6 +36,8 @@ fn main() -> anyhow::Result<()> {
             routing: AudioRouting::default(),
             follow_mtc: false,
             mtc_start: Timespan::ZERO,
+            layer: 1,
+            region: None,
         }],
         ..ShowFile::default()
     };

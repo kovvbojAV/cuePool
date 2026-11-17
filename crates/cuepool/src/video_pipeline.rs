@@ -1,7 +1,7 @@
 use crate::output_window::unpack_size;
 use crate::video_timing::fade_elapsed;
 use crate::{AppEvent, IDENTIFY_COLORS};
-use cuepool_core::{CanvasFit, LockExt};
+use cuepool_core::{CanvasFit, CanvasRect, LockExt, MAX_VIDEO_LAYERS};
 use cuepool_gui::{SharedStateHandle, VideoDiagnostics, VideoTimings};
 use cuepool_video::{
     FramePool, HapAcceleration, HapFallbackSession, VideoFrame, VideoSource, ZeroCopyAvailability,
@@ -33,7 +33,8 @@ pub(crate) struct OutputFrameState {
     pub(crate) canvas_size: [u32; 2],
     /// Anything to show (video frame, still image, or text overlay).
     pub(crate) has_content: bool,
-    /// Stop-cue picture fade (1.0 = full brightness).
+    /// Stop-cue fade of a still image (1.0 = full brightness). Video layers
+    /// fade in the layer composite instead.
     pub(crate) opacity: f32,
     pub(crate) identify: bool,
     /// Live projection outputs (source rect / edge blend edits apply live).
@@ -66,19 +67,20 @@ pub(crate) struct VideoSeekFrameRequest {
     pub(crate) adjust_show_clock: bool,
 }
 
-/// Video playback control shared between the winit thread and the video
-/// consume thread. The winit thread owns user-driven mutations (play, stop,
-/// pause, seek, step, MTC nudges); the consume thread owns the decode-channel
-/// drain, the canvas/overlay textures, and the frame-state publish.
-///
-/// Lock order: this is a LEAF lock — never held while taking the GUI state
-/// lock or the frame bundle lock, and those two are never held while taking
-/// this one. The 1 s step-back `recv_timeout` happens AFTER the request is
-/// taken out and the guard dropped.
+/// Video layers that can play at once (index 0 = cue layer 1).
+pub(crate) const VIDEO_LAYERS: usize = MAX_VIDEO_LAYERS as usize;
+
+/// Index into [`VideoControl::layers`] for a cue's 1-based layer number.
+pub(crate) fn layer_index(layer: u8) -> usize {
+    usize::from(layer.clamp(1, MAX_VIDEO_LAYERS) - 1)
+}
+
+/// One video layer's stream state. See [`VideoControl`] for ownership.
 #[derive(Default)]
-pub(crate) struct VideoControl {
+pub(crate) struct StreamControl {
     /// Playback identity. Every play/stop transition invalidates receiver and
-    /// frame work captured under an older epoch.
+    /// frame work captured under an older epoch. Unique across layers — take
+    /// new ones from [`VideoControl::bump_epoch`].
     pub(crate) stream_epoch: u64,
     /// Current decode channel receiver, installed by `spawn_video_decode` on
     /// the winit thread and taken out by the consume thread. A new receiver
@@ -89,8 +91,6 @@ pub(crate) struct VideoControl {
     pub(crate) clock: Option<Instant>,
     /// Set while paused, to freeze `clock` across the pause.
     pub(crate) pause_started: Option<Instant>,
-    /// Mirror of `App::paused`.
-    pub(crate) paused: bool,
     /// A frame-step was requested while paused: consume one video frame.
     pub(crate) step_pending: bool,
     /// PTS of the frame the consume thread has peeked but not yet shown
@@ -113,12 +113,46 @@ pub(crate) struct VideoControl {
     pub(crate) media_length_secs: Option<f64>,
     /// Media timestamp corresponding to position zero in `ActiveCueInfo`.
     pub(crate) timeline_offset_secs: f64,
-    /// Mirrors of `App::current_video_qid.is_some()` / `current_text_qid.is_some()`.
-    pub(crate) video_active: bool,
-    pub(crate) text_active: bool,
-    /// A frame has been uploaded to the canvas (written by the consume thread,
+    /// Mirror of this layer's video cue being active on the winit thread.
+    pub(crate) active: bool,
+    /// A frame has been uploaded to this layer (written by the consume thread,
     /// cleared by the winit thread on stop/start).
     pub(crate) canvas_has_frame: bool,
+    /// Canvas placement, pushed by the winit thread; `None` = whole canvas.
+    /// The consume thread clamps it to the canvas.
+    pub(crate) region: Option<CanvasRect>,
+}
+
+impl StreamControl {
+    /// Stop-cue picture fade (1.0 = full brightness).
+    fn opacity(&self) -> f32 {
+        match self.fade {
+            Some((start, dur)) => {
+                1.0 - (fade_elapsed(start, self.pause_started).as_secs_f32() / dur).clamp(0.0, 1.0)
+            }
+            None => 1.0,
+        }
+    }
+}
+
+/// Video playback control shared between the winit thread and the video
+/// consume thread. The winit thread owns user-driven mutations (play, stop,
+/// pause, seek, step, MTC nudges); the consume thread owns the decode-channel
+/// drains, the layer/canvas/overlay textures, and the frame-state publish.
+///
+/// Lock order: this is a LEAF lock — never held while taking the GUI state
+/// lock or the frame bundle lock, and those two are never held while taking
+/// this one. The 1 s step-back `recv_timeout` happens AFTER the request is
+/// taken out and the guard dropped.
+#[derive(Default)]
+pub(crate) struct VideoControl {
+    pub(crate) layers: [StreamControl; VIDEO_LAYERS],
+    /// Last stream epoch handed out (shared by every layer).
+    next_epoch: u64,
+    /// Mirror of `App::paused`.
+    pub(crate) paused: bool,
+    /// Mirror of `App::current_text_qid.is_some()`.
+    pub(crate) text_active: bool,
     /// Identify flash state, refreshed by the winit thread each tick.
     pub(crate) identify: bool,
     /// Canvas fit mode for frame uploads, pushed by the winit thread.
@@ -142,6 +176,16 @@ pub(crate) struct VideoControl {
     pub(crate) consume_ticks: u32,
     pub(crate) consume_coalesced: u32,
     pub(crate) consume_max_iter_us: u32,
+}
+
+impl VideoControl {
+    /// Give `layer` a new stream identity. Epochs stay unique across layers,
+    /// so EOF routing and the Windows retirement queue can key on them alone.
+    pub(crate) fn bump_epoch(&mut self, layer: usize) -> u64 {
+        self.next_epoch += 1;
+        self.layers[layer].stream_epoch = self.next_epoch;
+        self.next_epoch
+    }
 }
 
 /// Cue-driven canvas/overlay work for the consume thread (rare; the video
@@ -295,6 +339,27 @@ fn update_vsync_interval(
         .clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX)
 }
 
+/// One video layer's consume-thread state: its decode channel, peeked
+/// frame, converters and region-sized texture. Moved out for each pass of
+/// the consume loop and put back after it.
+#[derive(Default)]
+struct LayerState {
+    // Decode channel taken out of the control struct; None when stopped/EOF.
+    rx: Option<std::sync::mpsc::Receiver<VideoMessage>>,
+    // Epoch captured with `rx`; all frame work is discarded if control moves on.
+    rx_epoch: Option<u64>,
+    // Next decoded frame, peeked but not yet due.
+    peek: Option<VideoFrame>,
+    timings: VideoTimings,
+    upload_timing: TimingWindow,
+    conversion_submit_timing: TimingWindow,
+    yuv_converter: Option<cuepool_video::YuvConverter>,
+    hap_converter: Option<cuepool_video::HapConverter>,
+    notchlc_converter: Option<cuepool_video::NotchLcConverter>,
+    // This layer's picture, sized to its clamped region.
+    texture: Option<cuepool_video::CanvasTexture>,
+}
+
 /// Video consume thread: owns the canvas/overlay textures, the YUV converter,
 /// the decode-channel drain and the frame-state publish — every non-egui GPU
 /// call. Moving this off the winit thread is the Windows fix: NVIDIA's Vulkan
@@ -325,21 +390,14 @@ pub(crate) fn video_consume_thread(
 ) {
     let mut canvas: Option<cuepool_video::CanvasTexture> = None;
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
-    let mut yuv_converter: Option<cuepool_video::YuvConverter> = None;
-    let mut hap_converter: Option<cuepool_video::HapConverter> = None;
-    let mut notchlc_converter: Option<cuepool_video::NotchLcConverter> = None;
-    // Decode channel taken out of the control struct; None when stopped/EOF.
-    let mut rx: Option<std::sync::mpsc::Receiver<VideoMessage>> = None;
-    // Epoch captured with `rx`; all frame work is discarded if control moves on.
-    let mut rx_epoch: Option<u64> = None;
-    // Next decoded frame, peeked but not yet due.
-    let mut peek: Option<VideoFrame> = None;
+    let mut layers: [LayerState; VIDEO_LAYERS] = Default::default();
+    let mut compositor: Option<cuepool_video::LayerCompositor> = None;
+    // Layers (index, region, opacity) drawn by the last composite; any change
+    // (a layer starting/stopping, a region edit, a fade step) recomposites.
+    let mut last_drawn: Vec<(usize, CanvasRect, f32)> = Vec::new();
     // Live outputs copy (re-cloned only when `outputs_gen` advances).
     let mut outputs: Vec<cuepool_core::ProjectorOutput> = Vec::new();
     let mut outputs_gen = 0u64;
-    let mut timings = VideoTimings::default();
-    let mut upload_timing = TimingWindow::default();
-    let mut conversion_submit_timing = TimingWindow::default();
     #[cfg(windows)]
     let mut direct_retirement = cuepool_video::SubmissionRetirement::default();
     #[cfg(windows)]
@@ -445,539 +503,718 @@ pub(crate) fn video_consume_thread(
             }
         }
 
-        let mut terminal = None;
+        let mut composite_dirty = views_dirty;
+        // Shortest wait any live layer asks for; idle/paused falls back to 2 ms.
+        let mut next_wake: Option<Duration> = None;
 
-        // ── Control handshake: new stream, stop, paused seek ──
-        {
-            let mut ctl = control.lock_unpoisoned();
-            if rx_epoch.is_some_and(|epoch| epoch != ctl.stream_epoch) {
-                rx = None;
-                rx_epoch = None;
-                peek = None;
-                ctl.peek_pts = None;
-            }
-            // A newly installed receiver = a new stream: take it and drop the
-            // peeked frame (stale PTS).
-            if let Some(new_rx) = ctl.frame_rx.take() {
-                rx = Some(new_rx);
-                rx_epoch = Some(ctl.stream_epoch);
-                timings = ctl.timings.clone();
-                upload_timing = TimingWindow::default();
-                conversion_submit_timing = TimingWindow::default();
-                peek = None;
-                ctl.peek_pts = None;
-            }
-            // Clock cleared (stop / still-image cue): retire the channel so the
-            // decode thread's next send fails and it exits.
-            if ctl.clock.is_none() {
-                rx = None;
-                rx_epoch = None;
-                peek = None;
-                ctl.peek_pts = None;
-            }
-        }
-        // A paused seek waits here, off the GUI thread, for the new decoder's
-        // first frame. Frame-step-back also snaps both clocks to that frame.
-        let seek_frame = {
-            let mut ctl = control.lock_unpoisoned();
-            (rx_epoch == Some(ctl.stream_epoch))
-                .then(|| ctl.seek_frame.take())
-                .flatten()
-        };
-        if let Some(request) = seek_frame {
-            peek = None;
-            let delivered = rx
-                .as_ref()
-                .map(|r| r.recv_timeout(Duration::from_millis(1000)));
-            let mut ctl = control.lock_unpoisoned();
-            if rx_epoch != Some(ctl.stream_epoch) {
-                rx = None;
-                rx_epoch = None;
-            } else {
-                match delivered {
-                    Some(Ok(VideoMessage::Frame(f))) => {
-                        let delta = request.position - f.pts;
-                        if delta > 0.0 && request.adjust_show_clock {
-                            if let Some(c) = ctl.clock {
-                                // Moving the epoch forward rewinds the paused position.
-                                ctl.clock = Some(c + Duration::from_secs_f64(delta));
-                            }
-                            ctl.seek_show_delta = Some(delta);
-                        }
-                        ctl.peek_pts = Some(f.pts);
-                        peek = Some(f);
-                        ctl.step_pending = true;
-                    }
-                    Some(Ok(VideoMessage::Eof)) => {
-                        rx = None;
-                        terminal = rx_epoch.map(|epoch| (epoch, false));
-                        ctl.peek_pts = None;
-                    }
-                    Some(Ok(VideoMessage::Failed)) => {
-                        rx = None;
-                        terminal = rx_epoch.map(|epoch| (epoch, true));
-                        ctl.peek_pts = None;
-                    }
-                    Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
-                        rx = None;
-                        terminal = rx_epoch.map(|epoch| (epoch, true));
-                        ctl.peek_pts = None;
-                    }
-                    Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
-                        log::warn!("Video seek: no frame delivered after seek");
-                    }
-                    None => {}
-                }
-            }
-        }
+        // ── Per-layer streams: handshake, due-frame selection, upload ──
+        for (li, layer) in layers.iter_mut().enumerate() {
+            let LayerState {
+                mut rx,
+                mut rx_epoch,
+                mut peek,
+                mut timings,
+                mut upload_timing,
+                mut conversion_submit_timing,
+                mut yuv_converter,
+                mut hap_converter,
+                mut notchlc_converter,
+                mut texture,
+            } = std::mem::take(layer);
 
-        // ── Due-frame selection against the video clock ──
-        let (position, fit, stepping) = {
-            let mut ctl = control.lock_unpoisoned();
-            let stream_current = rx_epoch == Some(ctl.stream_epoch);
-            let stepping = stream_current && std::mem::take(&mut ctl.step_pending);
-            let position = if stream_current && (!ctl.paused || stepping) {
-                // While paused-and-stepping, the target is the frozen position —
-                // clock.elapsed() keeps growing through the pause and would drain
-                // every buffered frame. +1µs absorbs the f64→Duration rounding of
-                // the step's clock adjustment so the frame it made due isn't held.
-                let pos = if let Some(h) = ctl.hold_position {
-                    Some(Duration::from_secs_f64(h.max(0.0)))
-                } else {
-                    ctl.clock.map(|clock| match ctl.pause_started {
-                        Some(paused_at) => paused_at.duration_since(clock),
-                        None => clock.elapsed(),
-                    })
-                };
-                pos.map(|t| {
-                    if stepping {
-                        t + Duration::from_micros(1)
-                    } else {
-                        t
-                    }
-                })
-            } else {
-                None
+            // Each layer renders into its own region-sized texture, so the
+            // converters' fit math places the picture inside the region.
+            // ponytail: a region resize blanks a paused/held picture until its
+            // next frame; keep the old texture and rescale if that bites.
+            let (region, live) = {
+                let ctl = control.lock_unpoisoned();
+                (ctl.layers[li].region, ctl.layers[li].clock.is_some())
             };
-            (position, ctl.fit, stepping)
-        };
-        // Keep one frame peeked while paused, and notice an immediately-following
-        // EOF even without a running target clock. A future frame still holds EOF
-        // behind it until playback resumes and presents that frame. Runs before
-        // the pacing decision so that decision can snap to the peeked frame's pts.
-        if peek.is_none() && terminal.is_none() {
-            match rx.as_ref().map(|r| r.try_recv()) {
-                Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
-                Some(Ok(VideoMessage::Eof)) => {
-                    rx = None;
-                    terminal = rx_epoch.map(|epoch| (epoch, false));
+            match canvas.as_ref() {
+                Some(c) if live => {
+                    let region = region.map_or(CanvasRect::full(c.width, c.height), |region| {
+                        region.clamped(c.width, c.height)
+                    });
+                    if texture
+                        .as_ref()
+                        .is_none_or(|t| t.width != region.width || t.height != region.height)
+                    {
+                        texture = Some(cuepool_video::CanvasTexture::new(
+                            &device,
+                            region.width,
+                            region.height,
+                        ));
+                    }
                 }
-                Some(Ok(VideoMessage::Failed)) => {
-                    rx = None;
-                    terminal = rx_epoch.map(|epoch| (epoch, true));
-                }
-                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                    rx = None;
-                    terminal = rx_epoch.map(|epoch| (epoch, true));
-                }
-                _ => {}
+                _ => texture = None,
             }
-        }
 
-        let pacing = frame_pacing_decision(
-            position,
-            stepping,
-            woke_on_vsync,
-            last_vsync_at.map(|tick| tick.elapsed()),
-            vsync_interval,
-            peek.as_ref().map(|f| f.pts),
-        );
-        let target = pacing.target;
-        woke_on_vsync = false;
+            let mut terminal = None;
 
-        let mut consumed: Option<VideoFrame> = None;
-        let mut dropped = 0u32;
-        if let Some(target) = target {
-            loop {
-                if peek.is_none() {
-                    match rx.as_ref().map(|r| r.try_recv()) {
-                        Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
+            // ── Control handshake: new stream, stop, paused seek ──
+            {
+                let mut ctl = control.lock_unpoisoned();
+                if rx_epoch.is_some_and(|epoch| epoch != ctl.layers[li].stream_epoch) {
+                    rx = None;
+                    rx_epoch = None;
+                    peek = None;
+                    ctl.layers[li].peek_pts = None;
+                }
+                // A newly installed receiver = a new stream: take it and drop the
+                // peeked frame (stale PTS).
+                if let Some(new_rx) = ctl.layers[li].frame_rx.take() {
+                    rx = Some(new_rx);
+                    rx_epoch = Some(ctl.layers[li].stream_epoch);
+                    timings = ctl.layers[li].timings.clone();
+                    upload_timing = TimingWindow::default();
+                    conversion_submit_timing = TimingWindow::default();
+                    peek = None;
+                    ctl.layers[li].peek_pts = None;
+                }
+                // Clock cleared (stop / still-image cue): retire the channel so the
+                // decode thread's next send fails and it exits.
+                if ctl.layers[li].clock.is_none() {
+                    rx = None;
+                    rx_epoch = None;
+                    peek = None;
+                    ctl.layers[li].peek_pts = None;
+                }
+            }
+            // A paused seek waits here, off the GUI thread, for the new decoder's
+            // first frame. Frame-step-back also snaps both clocks to that frame.
+            let seek_frame = {
+                let mut ctl = control.lock_unpoisoned();
+                (rx_epoch == Some(ctl.layers[li].stream_epoch))
+                    .then(|| ctl.layers[li].seek_frame.take())
+                    .flatten()
+            };
+            if let Some(request) = seek_frame {
+                peek = None;
+                let delivered = rx
+                    .as_ref()
+                    .map(|r| r.recv_timeout(Duration::from_millis(1000)));
+                let mut ctl = control.lock_unpoisoned();
+                if rx_epoch != Some(ctl.layers[li].stream_epoch) {
+                    rx = None;
+                    rx_epoch = None;
+                } else {
+                    match delivered {
+                        Some(Ok(VideoMessage::Frame(f))) => {
+                            let delta = request.position - f.pts;
+                            if delta > 0.0 && request.adjust_show_clock {
+                                if let Some(c) = ctl.layers[li].clock {
+                                    // Moving the epoch forward rewinds the paused position.
+                                    ctl.layers[li].clock = Some(c + Duration::from_secs_f64(delta));
+                                }
+                                ctl.layers[li].seek_show_delta = Some(delta);
+                            }
+                            ctl.layers[li].peek_pts = Some(f.pts);
+                            peek = Some(f);
+                            ctl.layers[li].step_pending = true;
+                        }
                         Some(Ok(VideoMessage::Eof)) => {
                             rx = None;
                             terminal = rx_epoch.map(|epoch| (epoch, false));
+                            ctl.layers[li].peek_pts = None;
                         }
                         Some(Ok(VideoMessage::Failed)) => {
                             rx = None;
                             terminal = rx_epoch.map(|epoch| (epoch, true));
+                            ctl.layers[li].peek_pts = None;
                         }
-                        Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        Some(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
                             rx = None;
                             terminal = rx_epoch.map(|epoch| (epoch, true));
+                            ctl.layers[li].peek_pts = None;
                         }
-                        _ => {}
-                    }
-                }
-                match peek.as_ref() {
-                    Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
-                        if let Some(discarded) = consumed.replace(peek.take().unwrap()) {
-                            dropped += 1;
-                            frame_pool.recycle_frame(discarded);
+                        Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                            log::warn!("Video seek: no frame delivered after seek");
                         }
+                        None => {}
                     }
-                    _ => break, // next frame not due yet, or channel empty
                 }
             }
-        }
-        if dropped != 0 {
-            control.lock_unpoisoned().dropped += dropped;
-        }
 
-        // Check immediately before GPU work without holding the control lock
-        // across uploads/submits. The write-back below checks again afterward.
-        if consumed.is_some()
-            && rx_epoch.is_none_or(|epoch| control.lock_unpoisoned().stream_epoch != epoch)
-        {
-            if let Some(f) = consumed.take() {
-                frame_pool.recycle_frame(f);
+            // ── Due-frame selection against the video clock ──
+            let (position, fit, stepping) = {
+                let mut ctl = control.lock_unpoisoned();
+                let stream_current = rx_epoch == Some(ctl.layers[li].stream_epoch);
+                let stepping = stream_current && std::mem::take(&mut ctl.layers[li].step_pending);
+                let position = if stream_current && (!ctl.paused || stepping) {
+                    // While paused-and-stepping, the target is the frozen position —
+                    // clock.elapsed() keeps growing through the pause and would drain
+                    // every buffered frame. +1µs absorbs the f64→Duration rounding of
+                    // the step's clock adjustment so the frame it made due isn't held.
+                    let pos = if let Some(h) = ctl.layers[li].hold_position {
+                        Some(Duration::from_secs_f64(h.max(0.0)))
+                    } else {
+                        ctl.layers[li]
+                            .clock
+                            .map(|clock| match ctl.layers[li].pause_started {
+                                Some(paused_at) => paused_at.duration_since(clock),
+                                None => clock.elapsed(),
+                            })
+                    };
+                    pos.map(|t| {
+                        if stepping {
+                            t + Duration::from_micros(1)
+                        } else {
+                            t
+                        }
+                    })
+                } else {
+                    None
+                };
+                (position, ctl.fit, stepping)
+            };
+            // Keep one frame peeked while paused, and notice an immediately-following
+            // EOF even without a running target clock. A future frame still holds EOF
+            // behind it until playback resumes and presents that frame. Runs before
+            // the pacing decision so that decision can snap to the peeked frame's pts.
+            if peek.is_none() && terminal.is_none() {
+                match rx.as_ref().map(|r| r.try_recv()) {
+                    Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
+                    Some(Ok(VideoMessage::Eof)) => {
+                        rx = None;
+                        terminal = rx_epoch.map(|epoch| (epoch, false));
+                    }
+                    Some(Ok(VideoMessage::Failed)) => {
+                        rx = None;
+                        terminal = rx_epoch.map(|epoch| (epoch, true));
+                    }
+                    Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                        rx = None;
+                        terminal = rx_epoch.map(|epoch| (epoch, true));
+                    }
+                    _ => {}
+                }
             }
-            if let Some(f) = peek.take() {
-                frame_pool.recycle_frame(f);
-            }
-            rx = None;
-            rx_epoch = None;
-            terminal = None;
-        }
 
-        // ── Upload the newest due frame to the canvas (GPU work) ──
-        if let Some(frame) = consumed {
-            let mut frame_presented = true;
-            #[cfg(windows)]
-            let mut direct_submitted = false;
-            let mut uploaded = false;
-            match &frame.pixels {
-                cuepool_video::FramePixels::Rgba(_) => {
-                    if let Some(c) = canvas.as_ref() {
-                        let _configure_guard =
-                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
-                        let upload_started = Instant::now();
-                        c.upload_frame(queue.queue(), &frame, fit);
-                        timings
-                            .upload
-                            .set_ms(upload_timing.record(upload_started.elapsed()));
-                        uploaded = true;
-                    }
-                }
-                cuepool_video::FramePixels::Hap { .. } => {
-                    if hap_converter.is_none() {
-                        hap_converter = Some(cuepool_video::HapConverter::new(
-                            &device,
-                            wgpu::TextureFormat::Rgba8Unorm,
-                        ));
-                    }
-                    if let (Some(c), Some(conv)) = (canvas.as_ref(), hap_converter.as_mut()) {
-                        let _configure_guard =
-                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
-                        let upload_started = Instant::now();
-                        match conv.upload(&device, queue.queue(), &frame, [c.width, c.height], fit)
-                        {
-                            Ok(()) => {
-                                timings
-                                    .upload
-                                    .set_ms(upload_timing.record(upload_started.elapsed()));
-                                let conversion_started = Instant::now();
-                                let mut encoder = device.create_command_encoder(
-                                    &wgpu::CommandEncoderDescriptor {
-                                        label: Some("canvas-hap-convert"),
-                                    },
-                                );
-                                conv.encode(&mut encoder, &c.render_view());
-                                queue.submit(std::iter::once(encoder.finish()));
-                                timings.conversion_submit.set_ms(
-                                    conversion_submit_timing.record(conversion_started.elapsed()),
-                                );
-                                uploaded = true;
+            let pacing = frame_pacing_decision(
+                position,
+                stepping,
+                woke_on_vsync,
+                last_vsync_at.map(|tick| tick.elapsed()),
+                vsync_interval,
+                peek.as_ref().map(|f| f.pts),
+            );
+            let target = pacing.target;
+
+            let mut consumed: Option<VideoFrame> = None;
+            let mut dropped = 0u32;
+            if let Some(target) = target {
+                loop {
+                    if peek.is_none() {
+                        match rx.as_ref().map(|r| r.try_recv()) {
+                            Some(Ok(VideoMessage::Frame(f))) => peek = Some(f),
+                            Some(Ok(VideoMessage::Eof)) => {
+                                rx = None;
+                                terminal = rx_epoch.map(|epoch| (epoch, false));
                             }
-                            Err(error) => {
-                                log::warn!("Video HAP upload skipped: {error}");
-                                frame_presented = false;
+                            Some(Ok(VideoMessage::Failed)) => {
+                                rx = None;
+                                terminal = rx_epoch.map(|epoch| (epoch, true));
                             }
+                            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                                rx = None;
+                                terminal = rx_epoch.map(|epoch| (epoch, true));
+                            }
+                            _ => {}
                         }
                     }
-                }
-                cuepool_video::FramePixels::NotchLc { .. } => {
-                    if notchlc_converter.is_none() {
-                        notchlc_converter = Some(cuepool_video::NotchLcConverter::new(
-                            &device,
-                            wgpu::TextureFormat::Rgba8Unorm,
-                        ));
-                    }
-                    if let (Some(c), Some(conv)) = (canvas.as_ref(), notchlc_converter.as_mut()) {
-                        let _configure_guard =
-                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
-                        let upload_started = Instant::now();
-                        match conv.upload(&device, queue.queue(), &frame, [c.width, c.height], fit)
-                        {
-                            Ok(()) => {
-                                timings
-                                    .upload
-                                    .set_ms(upload_timing.record(upload_started.elapsed()));
-                                let conversion_started = Instant::now();
-                                let mut encoder = device.create_command_encoder(
-                                    &wgpu::CommandEncoderDescriptor {
-                                        label: Some("canvas-notchlc-convert"),
-                                    },
-                                );
-                                // Decode dispatch and fit pass share the encoder,
-                                // so this stays one submit, as the HAP path is.
-                                conv.encode(&device, &mut encoder, &c.render_view());
-                                queue.submit(std::iter::once(encoder.finish()));
-                                timings.conversion_submit.set_ms(
-                                    conversion_submit_timing.record(conversion_started.elapsed()),
-                                );
-                                uploaded = true;
-                            }
-                            Err(error) => {
-                                log::warn!("Video NotchLC upload skipped: {error}");
-                                frame_presented = false;
+                    match peek.as_ref() {
+                        Some(f) if Duration::from_secs_f64(f.pts.max(0.0)) <= target => {
+                            if let Some(discarded) = consumed.replace(peek.take().unwrap()) {
+                                dropped += 1;
+                                frame_pool.recycle_frame(discarded);
                             }
                         }
+                        _ => break, // next frame not due yet, or channel empty
                     }
                 }
+            }
+            if dropped != 0 {
+                control.lock_unpoisoned().dropped += dropped;
+            }
+
+            // Check immediately before GPU work without holding the control lock
+            // across uploads/submits. The write-back below checks again afterward.
+            if consumed.is_some()
+                && rx_epoch
+                    .is_none_or(|epoch| control.lock_unpoisoned().layers[li].stream_epoch != epoch)
+            {
+                if let Some(f) = consumed.take() {
+                    frame_pool.recycle_frame(f);
+                }
+                if let Some(f) = peek.take() {
+                    frame_pool.recycle_frame(f);
+                }
+                rx = None;
+                rx_epoch = None;
+                terminal = None;
+            }
+
+            // ── Upload the newest due frame to the canvas (GPU work) ──
+            if let Some(frame) = consumed {
+                let mut frame_presented = true;
                 #[cfg(windows)]
-                cuepool_video::FramePixels::D3d12Nv12(direct) => {
-                    if let Err(reason) =
-                        cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(|| {
-                            if yuv_converter.is_none() {
-                                yuv_converter = Some(cuepool_video::YuvConverter::new(
-                                    &device,
-                                    wgpu::TextureFormat::Rgba8Unorm,
-                                ));
-                            }
-                        })
-                    {
-                        direct.complete(Err(reason));
-                        frame_presented = false;
+                let mut direct_submitted = false;
+                let mut uploaded = false;
+                match &frame.pixels {
+                    cuepool_video::FramePixels::Rgba(_) => {
+                        if let Some(c) = texture.as_ref() {
+                            let _configure_guard =
+                                configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                            let upload_started = Instant::now();
+                            c.upload_frame(queue.queue(), &frame, fit);
+                            timings
+                                .upload
+                                .set_ms(upload_timing.record(upload_started.elapsed()));
+                            uploaded = true;
+                        }
                     }
-                    if frame_presented
-                        && let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut())
-                    {
-                        let _configure_guard =
-                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
-                        if let Some(readback) = direct.take_canary_readback() {
-                            let canary_result = cuepool_video::YuvConverter::run_d3d12_canary(
+                    cuepool_video::FramePixels::Hap { .. } => {
+                        if hap_converter.is_none() {
+                            hap_converter = Some(cuepool_video::HapConverter::new(
                                 &device,
-                                &queue,
+                                wgpu::TextureFormat::Rgba8Unorm,
+                            ));
+                        }
+                        if let (Some(c), Some(conv)) = (texture.as_ref(), hap_converter.as_mut()) {
+                            let _configure_guard =
+                                configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                            let upload_started = Instant::now();
+                            match conv.upload(
+                                &device,
+                                queue.queue(),
                                 &frame,
-                                &readback,
                                 [c.width, c.height],
                                 fit,
-                            );
-                            frame_pool.recycle_frame(readback);
-                            if let Err(reason) = canary_result {
-                                let reason = format!("zero-copy canary failed: {reason}");
-                                direct.complete(Err(reason));
-                                frame_presented = false;
+                            ) {
+                                Ok(()) => {
+                                    timings
+                                        .upload
+                                        .set_ms(upload_timing.record(upload_started.elapsed()));
+                                    let conversion_started = Instant::now();
+                                    let mut encoder = device.create_command_encoder(
+                                        &wgpu::CommandEncoderDescriptor {
+                                            label: Some("canvas-hap-convert"),
+                                        },
+                                    );
+                                    conv.encode(&mut encoder, &c.render_view());
+                                    queue.submit(std::iter::once(encoder.finish()));
+                                    timings.conversion_submit.set_ms(
+                                        conversion_submit_timing
+                                            .record(conversion_started.elapsed()),
+                                    );
+                                    uploaded = true;
+                                }
+                                Err(error) => {
+                                    log::warn!("Video HAP upload skipped: {error}");
+                                    frame_presented = false;
+                                }
                             }
                         }
-
-                        if frame_presented {
-                            let prepared =
-                                cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(
-                                    || {
-                                        let upload_started = Instant::now();
-                                        conv.upload(
-                                            &device,
-                                            queue.queue(),
-                                            &frame,
-                                            [c.width, c.height],
-                                            fit,
-                                        );
-                                        timings
-                                            .upload
-                                            .set_ms(upload_timing.record(upload_started.elapsed()));
-                                        let conversion_started = Instant::now();
-                                        let mut convert_encoder = device.create_command_encoder(
-                                            &wgpu::CommandEncoderDescriptor {
-                                                label: Some("canvas-d3d12va-convert"),
-                                            },
-                                        );
-                                        conv.encode(&mut convert_encoder, &c.render_view());
-                                        (convert_encoder.finish(), conversion_started)
-                                    },
-                                );
-                            let epoch = rx_epoch.unwrap_or_default();
-                            let retired = direct_retirement.submit(epoch, direct.clone());
-                            match (prepared, retired) {
-                                (Ok((command_buffer, conversion_started)), Ok(completed)) => {
-                                    let callback_completed = Arc::clone(&completed);
-                                    let retirement_tx = retirement_tx.clone();
-                                    let submitted = match cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(
-                                        || {
-                                            // The decode fence is staged and drained by exactly
-                                            // this submission inside the serialized queue, so the
-                                            // conversion cannot sample the frame before the
-                                            // decoder signals it.
-                                            queue.submit_with_decode_wait(
-                                                direct.decode_fence(),
-                                                [command_buffer],
-                                            )?;
-                                            queue.queue().on_submitted_work_done(move || {
-                                                callback_completed.store(true, Ordering::Release);
-                                                let _ = retirement_tx.send(());
-                                            });
-                                            Ok(())
+                    }
+                    cuepool_video::FramePixels::NotchLc { .. } => {
+                        if notchlc_converter.is_none() {
+                            notchlc_converter = Some(cuepool_video::NotchLcConverter::new(
+                                &device,
+                                wgpu::TextureFormat::Rgba8Unorm,
+                            ));
+                        }
+                        if let (Some(c), Some(conv)) =
+                            (texture.as_ref(), notchlc_converter.as_mut())
+                        {
+                            let _configure_guard =
+                                configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                            let upload_started = Instant::now();
+                            match conv.upload(
+                                &device,
+                                queue.queue(),
+                                &frame,
+                                [c.width, c.height],
+                                fit,
+                            ) {
+                                Ok(()) => {
+                                    timings
+                                        .upload
+                                        .set_ms(upload_timing.record(upload_started.elapsed()));
+                                    let conversion_started = Instant::now();
+                                    let mut encoder = device.create_command_encoder(
+                                        &wgpu::CommandEncoderDescriptor {
+                                            label: Some("canvas-notchlc-convert"),
                                         },
-                                    ) {
-                                        Ok(submitted) => submitted,
-                                        Err(reason) => Err(reason),
-                                    };
-                                    if let Err(reason) = submitted {
+                                    );
+                                    // Decode dispatch and fit pass share the encoder,
+                                    // so this stays one submit, as the HAP path is.
+                                    conv.encode(&device, &mut encoder, &c.render_view());
+                                    queue.submit(std::iter::once(encoder.finish()));
+                                    timings.conversion_submit.set_ms(
+                                        conversion_submit_timing
+                                            .record(conversion_started.elapsed()),
+                                    );
+                                    uploaded = true;
+                                }
+                                Err(error) => {
+                                    log::warn!("Video NotchLC upload skipped: {error}");
+                                    frame_presented = false;
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(windows)]
+                    cuepool_video::FramePixels::D3d12Nv12(direct) => {
+                        if let Err(reason) =
+                            cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(|| {
+                                if yuv_converter.is_none() {
+                                    yuv_converter = Some(cuepool_video::YuvConverter::new(
+                                        &device,
+                                        wgpu::TextureFormat::Rgba8Unorm,
+                                    ));
+                                }
+                            })
+                        {
+                            direct.complete(Err(reason));
+                            frame_presented = false;
+                        }
+                        if frame_presented
+                            && let (Some(c), Some(conv)) =
+                                (texture.as_ref(), yuv_converter.as_mut())
+                        {
+                            let _configure_guard =
+                                configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                            if let Some(readback) = direct.take_canary_readback() {
+                                let canary_result = cuepool_video::YuvConverter::run_d3d12_canary(
+                                    &device,
+                                    &queue,
+                                    &frame,
+                                    &readback,
+                                    [c.width, c.height],
+                                    fit,
+                                );
+                                frame_pool.recycle_frame(readback);
+                                if let Err(reason) = canary_result {
+                                    let reason = format!("zero-copy canary failed: {reason}");
+                                    direct.complete(Err(reason));
+                                    frame_presented = false;
+                                }
+                            }
+
+                            if frame_presented {
+                                let prepared =
+                                    cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(
+                                        || {
+                                            let upload_started = Instant::now();
+                                            conv.upload(
+                                                &device,
+                                                queue.queue(),
+                                                &frame,
+                                                [c.width, c.height],
+                                                fit,
+                                            );
+                                            timings.upload.set_ms(
+                                                upload_timing.record(upload_started.elapsed()),
+                                            );
+                                            let conversion_started = Instant::now();
+                                            let mut convert_encoder = device
+                                                .create_command_encoder(
+                                                    &wgpu::CommandEncoderDescriptor {
+                                                        label: Some("canvas-d3d12va-convert"),
+                                                    },
+                                                );
+                                            conv.encode(&mut convert_encoder, &c.render_view());
+                                            (convert_encoder.finish(), conversion_started)
+                                        },
+                                    );
+                                let epoch = rx_epoch.unwrap_or_default();
+                                let retired = direct_retirement.submit(epoch, direct.clone());
+                                match (prepared, retired) {
+                                    (Ok((command_buffer, conversion_started)), Ok(completed)) => {
+                                        let callback_completed = Arc::clone(&completed);
+                                        let retirement_tx = retirement_tx.clone();
+                                        let submitted = match cuepool_video::ZeroCopyAvailability::catch_direct_path_panic(
+                                            || {
+                                                // The decode fence is staged and drained by exactly
+                                                // this submission inside the serialized queue, so the
+                                                // conversion cannot sample the frame before the
+                                                // decoder signals it.
+                                                queue.submit_with_decode_wait(
+                                                    direct.decode_fence(),
+                                                    [command_buffer],
+                                                )?;
+                                                queue.queue().on_submitted_work_done(move || {
+                                                    callback_completed.store(true, Ordering::Release);
+                                                    let _ = retirement_tx.send(());
+                                                });
+                                                Ok(())
+                                            },
+                                        ) {
+                                            Ok(submitted) => submitted,
+                                            Err(reason) => Err(reason),
+                                        };
+                                        if let Err(reason) = submitted {
+                                            completed.store(true, Ordering::Release);
+                                            direct_retirement.drain_completed();
+                                            direct.complete(Err(reason));
+                                            frame_presented = false;
+                                        } else {
+                                            // The retirement queue keeps the AVFrame leased through
+                                            // GPU completion; the decoder only needs to wait until
+                                            // the conversion has been submitted so it can queue ahead.
+                                            direct.complete(Ok(()));
+                                            direct_submitted = true;
+                                            uploaded = true;
+                                            timings.conversion_submit.set_ms(
+                                                conversion_submit_timing
+                                                    .record(conversion_started.elapsed()),
+                                            );
+                                        }
+                                    }
+                                    (Err(reason), Ok(completed)) => {
                                         completed.store(true, Ordering::Release);
                                         direct_retirement.drain_completed();
                                         direct.complete(Err(reason));
                                         frame_presented = false;
-                                    } else {
-                                        // The retirement queue keeps the AVFrame leased through
-                                        // GPU completion; the decoder only needs to wait until
-                                        // the conversion has been submitted so it can queue ahead.
-                                        direct.complete(Ok(()));
-                                        direct_submitted = true;
-                                        uploaded = true;
-                                        timings.conversion_submit.set_ms(
-                                            conversion_submit_timing
-                                                .record(conversion_started.elapsed()),
-                                        );
+                                    }
+                                    (Ok(_), Err(_)) => {
+                                        direct.complete(Err(
+                                            "zero-copy submission retirement budget exhausted"
+                                                .into(),
+                                        ));
+                                        frame_presented = false;
+                                    }
+                                    (Err(reason), Err(_)) => {
+                                        direct.complete(Err(reason));
+                                        frame_presented = false;
                                     }
                                 }
-                                (Err(reason), Ok(completed)) => {
-                                    completed.store(true, Ordering::Release);
-                                    direct_retirement.drain_completed();
-                                    direct.complete(Err(reason));
-                                    frame_presented = false;
-                                }
-                                (Ok(_), Err(_)) => {
-                                    direct.complete(Err(
-                                        "zero-copy submission retirement budget exhausted".into(),
-                                    ));
-                                    frame_presented = false;
-                                }
-                                (Err(reason), Err(_)) => {
-                                    direct.complete(Err(reason));
-                                    frame_presented = false;
-                                }
                             }
+                        } else if frame_presented {
+                            direct.complete(Err("zero-copy canvas is unavailable".into()));
+                            frame_presented = false;
                         }
-                    } else if frame_presented {
-                        direct.complete(Err("zero-copy canvas is unavailable".into()));
-                        frame_presented = false;
+                    }
+                    _ => {
+                        // GPU path: upload decoded planes, then run the YUV→RGB
+                        // convert as its own standalone submit (no CPU swscale, no
+                        // 23 MB RGBA copy).
+                        if yuv_converter.is_none() {
+                            yuv_converter = Some(cuepool_video::YuvConverter::new(
+                                &device,
+                                wgpu::TextureFormat::Rgba8Unorm,
+                            ));
+                        }
+                        if let (Some(c), Some(conv)) = (texture.as_ref(), yuv_converter.as_mut()) {
+                            let _configure_guard =
+                                configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                            let upload_started = Instant::now();
+                            conv.upload(&device, queue.queue(), &frame, [c.width, c.height], fit);
+                            timings
+                                .upload
+                                .set_ms(upload_timing.record(upload_started.elapsed()));
+                            let conversion_started = Instant::now();
+                            let mut encoder =
+                                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("canvas-yuv-convert"),
+                                });
+                            conv.encode(&mut encoder, &c.render_view());
+                            queue.submit(std::iter::once(encoder.finish()));
+                            timings.conversion_submit.set_ms(
+                                conversion_submit_timing.record(conversion_started.elapsed()),
+                            );
+                            uploaded = true;
+                        }
                     }
                 }
-                _ => {
-                    // GPU path: upload decoded planes, then run the YUV→RGB
-                    // convert as its own standalone submit (no CPU swscale, no
-                    // 23 MB RGBA copy).
-                    if yuv_converter.is_none() {
-                        yuv_converter = Some(cuepool_video::YuvConverter::new(
-                            &device,
-                            wgpu::TextureFormat::Rgba8Unorm,
-                        ));
+                composite_dirty |= uploaded;
+                let mut ctl = control.lock_unpoisoned();
+                if uploaded {
+                    ctl.uploads += 1;
+                }
+                if rx_epoch == Some(ctl.layers[li].stream_epoch) {
+                    if frame_presented {
+                        ctl.layers[li].last_pts = Some(frame.pts);
+                        ctl.layers[li].canvas_has_frame = true;
                     }
-                    if let (Some(c), Some(conv)) = (canvas.as_ref(), yuv_converter.as_mut()) {
-                        let _configure_guard =
-                            configure_gate.read().unwrap_or_else(|e| e.into_inner());
-                        let upload_started = Instant::now();
-                        conv.upload(&device, queue.queue(), &frame, [c.width, c.height], fit);
-                        timings
-                            .upload
-                            .set_ms(upload_timing.record(upload_started.elapsed()));
-                        let conversion_started = Instant::now();
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("canvas-yuv-convert"),
-                            });
-                        conv.encode(&mut encoder, &c.render_view());
-                        queue.submit(std::iter::once(encoder.finish()));
-                        timings
-                            .conversion_submit
-                            .set_ms(conversion_submit_timing.record(conversion_started.elapsed()));
-                        uploaded = true;
-                    }
-                }
-            }
-            let mut ctl = control.lock_unpoisoned();
-            if uploaded {
-                ctl.uploads += 1;
-            }
-            if rx_epoch == Some(ctl.stream_epoch) {
-                if frame_presented {
-                    ctl.last_pts = Some(frame.pts);
-                    ctl.canvas_has_frame = true;
-                }
-                ctl.peek_pts = peek.as_ref().map(|f| f.pts);
-            } else {
-                drop(ctl);
-                rx = None;
-                rx_epoch = None;
-                peek = None;
-                terminal = None;
-            }
-            #[cfg(windows)]
-            if direct_submitted {
-                drop(frame);
-            } else {
-                frame_pool.recycle_frame(frame);
-            }
-            #[cfg(not(windows))]
-            frame_pool.recycle_frame(frame);
-        } else if let Some(epoch) = rx_epoch {
-            let mut ctl = control.lock_unpoisoned();
-            if ctl.stream_epoch == epoch {
-                ctl.peek_pts = peek.as_ref().map(|f| f.pts);
-                // Starved: a frame was due (clock running) but the channel is empty.
-                if target.is_some() && peek.is_none() && rx.is_some() {
-                    ctl.starved += 1;
-                }
-            } else {
-                drop(ctl);
-                rx = None;
-                rx_epoch = None;
-                peek = None;
-                terminal = None;
-            }
-        }
-
-        // The marker is observed only after every preceding frame has left the
-        // FIFO. Emit after the final due upload/write-back, tagged for winit.
-        if let Some((epoch, failed)) = terminal {
-            if rx_epoch == Some(epoch) {
-                let event = if failed {
-                    AppEvent::VideoFailed(epoch)
+                    ctl.layers[li].peek_pts = peek.as_ref().map(|f| f.pts);
                 } else {
-                    AppEvent::VideoEof(epoch)
-                };
-                let _ = proxy.send_event(event);
+                    drop(ctl);
+                    rx = None;
+                    rx_epoch = None;
+                    peek = None;
+                    terminal = None;
+                }
+                #[cfg(windows)]
+                if direct_submitted {
+                    drop(frame);
+                } else {
+                    frame_pool.recycle_frame(frame);
+                }
+                #[cfg(not(windows))]
+                frame_pool.recycle_frame(frame);
+            } else if let Some(epoch) = rx_epoch {
+                let mut ctl = control.lock_unpoisoned();
+                if ctl.layers[li].stream_epoch == epoch {
+                    ctl.layers[li].peek_pts = peek.as_ref().map(|f| f.pts);
+                    // Starved: a frame was due (clock running) but the channel is empty.
+                    if target.is_some() && peek.is_none() && rx.is_some() {
+                        ctl.starved += 1;
+                    }
+                } else {
+                    drop(ctl);
+                    rx = None;
+                    rx_epoch = None;
+                    peek = None;
+                    terminal = None;
+                }
             }
-            rx = None;
-            rx_epoch = None;
-            peek = None;
-        } else if rx.is_none() && peek.is_none() {
-            rx_epoch = None;
+
+            // The marker is observed only after every preceding frame has left the
+            // FIFO. Emit after the final due upload/write-back, tagged for winit.
+            if let Some((epoch, failed)) = terminal {
+                if rx_epoch == Some(epoch) {
+                    let event = if failed {
+                        AppEvent::VideoFailed { layer: li, epoch }
+                    } else {
+                        AppEvent::VideoEof { layer: li, epoch }
+                    };
+                    let _ = proxy.send_event(event);
+                }
+                rx = None;
+                rx_epoch = None;
+                peek = None;
+            } else if rx.is_none() && peek.is_none() {
+                rx_epoch = None;
+            }
+
+            // ── Pace this layer: wake after reference present, old poll as fallback ──
+            let sleep_for = match position {
+                None => Duration::from_millis(2), // paused/idle: watch for step/stop
+                Some(pos) => match peek.as_ref() {
+                    Some(f) => {
+                        let due_in = f.pts.max(0.0) - pos.as_secs_f64();
+                        if due_in <= 0.0 {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs_f64(due_in).min(Duration::from_millis(4))
+                        }
+                    }
+                    // Decode behind (or channel retired): poll quickly / lazily.
+                    None => {
+                        if rx.is_some() {
+                            Duration::from_millis(1)
+                        } else {
+                            Duration::from_millis(4)
+                        }
+                    }
+                },
+            };
+            // A frame held for the next healthy tick would otherwise leave the old
+            // due-now calculation at zero and spin instead of returning to the wait.
+            let sleep_for = if pacing.tick_paced {
+                sleep_for.max(Duration::from_millis(1))
+            } else {
+                sleep_for
+            };
+            // An idle layer has nothing to pace.
+            if rx.is_some() || peek.is_some() {
+                next_wake = Some(next_wake.map_or(sleep_for, |wake: Duration| wake.min(sleep_for)));
+            }
+
+            *layer = LayerState {
+                rx,
+                rx_epoch,
+                peek,
+                timings,
+                upload_timing,
+                conversion_submit_timing,
+                yuv_converter,
+                hap_converter,
+                notchlc_converter,
+                texture,
+            };
+        }
+        woke_on_vsync = false;
+
+        // ── Composite the layers into the canvas (lowest layer first) ──
+        {
+            let (drawn, any_live) = {
+                let ctl = control.lock_unpoisoned();
+                let mut drawn = Vec::new();
+                for (li, (stream, layer)) in ctl.layers.iter().zip(&layers).enumerate() {
+                    if let (Some(c), Some(texture), true, true) = (
+                        canvas.as_ref(),
+                        layer.texture.as_ref(),
+                        stream.clock.is_some(),
+                        stream.canvas_has_frame,
+                    ) {
+                        let region = stream
+                            .region
+                            .map_or(CanvasRect::full(c.width, c.height), |region| {
+                                region.clamped(c.width, c.height)
+                            });
+                        if (texture.width, texture.height) == (region.width, region.height) {
+                            drawn.push((li, region, stream.opacity()));
+                        }
+                    }
+                }
+                let any_live = ctl.layers.iter().any(|stream| stream.clock.is_some());
+                (drawn, any_live)
+            };
+            composite_dirty |= drawn != last_drawn;
+            // With no live layer the canvas belongs to stills/blanking; leave it.
+            if composite_dirty
+                && any_live
+                && let Some(c) = canvas.as_ref()
+            {
+                let compositor = compositor.get_or_insert_with(|| {
+                    cuepool_video::LayerCompositor::new(&device, wgpu::TextureFormat::Rgba8Unorm)
+                });
+                let views = drawn
+                    .iter()
+                    .filter_map(|(li, _, _)| layers[*li].texture.as_ref().map(|t| t.render_view()))
+                    .collect::<Vec<_>>();
+                let draws = drawn
+                    .iter()
+                    .zip(&views)
+                    .map(|((_, region, opacity), view)| cuepool_video::LayerDraw {
+                        view,
+                        region: *region,
+                        opacity: *opacity,
+                    })
+                    .collect::<Vec<_>>();
+                let _configure_guard = configure_gate.read().unwrap_or_else(|e| e.into_inner());
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("canvas-layer-composite"),
+                });
+                compositor.encode(&device, &mut encoder, &c.render_view(), &draws);
+                // ponytail: its own submit after the conversions; fold into the
+                // last conversion's encoder if conversion_submit timings regress.
+                queue.submit(std::iter::once(encoder.finish()));
+                last_drawn = drawn;
+            }
         }
 
         // ── Publish the frame-state bundle (change-detect + generation bump) ──
         {
             let (opacity, has_content, identify, new_outputs) = {
                 let ctl = control.lock_unpoisoned();
-                // Stop-cue picture fade: ramp to black; the winit thread stops
-                // playback when the ramp completes.
-                let opacity = match ctl.fade {
-                    Some((start, dur)) => {
-                        1.0 - (fade_elapsed(start, ctl.pause_started).as_secs_f32() / dur)
-                            .clamp(0.0, 1.0)
-                    }
-                    None => 1.0,
+                // Video layers fade in the composite; with none live, the
+                // canvas holds a still, which fades over the whole output.
+                let opacity = if ctl.layers.iter().any(|stream| stream.clock.is_some()) {
+                    1.0
+                } else {
+                    ctl.layers
+                        .iter()
+                        .map(StreamControl::opacity)
+                        .fold(1.0, f32::min)
                 };
-                let has_content = ctl.video_active || ctl.canvas_has_frame || ctl.text_active;
+                let has_content = ctl.text_active
+                    || ctl
+                        .layers
+                        .iter()
+                        .any(|stream| stream.active || stream.canvas_has_frame);
                 let new_outputs = if ctl.outputs_gen != outputs_gen {
                     outputs_gen = ctl.outputs_gen;
                     Some(ctl.outputs.clone())
@@ -1022,35 +1259,7 @@ pub(crate) fn video_consume_thread(
             }
         }
 
-        // ── Pace: wake after reference present, with the old poll as fallback ──
-        let sleep_for = match position {
-            None => Duration::from_millis(2), // paused/idle: watch for step/stop
-            Some(pos) => match peek.as_ref() {
-                Some(f) => {
-                    let due_in = f.pts.max(0.0) - pos.as_secs_f64();
-                    if due_in <= 0.0 {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_secs_f64(due_in).min(Duration::from_millis(4))
-                    }
-                }
-                // Decode behind (or channel retired): poll quickly / lazily.
-                None => {
-                    if rx.is_some() {
-                        Duration::from_millis(1)
-                    } else {
-                        Duration::from_millis(4)
-                    }
-                }
-            },
-        };
-        // A frame held for the next healthy tick would otherwise leave the old
-        // due-now calculation at zero and spin instead of returning to the wait.
-        let sleep_for = if pacing.tick_paced {
-            sleep_for.max(Duration::from_millis(1))
-        } else {
-            sleep_for
-        };
+        let sleep_for = next_wake.unwrap_or(Duration::from_millis(2));
         stat_iters += 1;
         let iter_us = iter_started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         stat_max_iter_us = stat_max_iter_us.max(iter_us);
@@ -1373,6 +1582,7 @@ pub(crate) fn video_decode_thread(
     frame_tx: std::sync::mpsc::SyncSender<VideoMessage>,
     diag_state: SharedStateHandle,
     video_control: Arc<Mutex<VideoControl>>,
+    layer: usize,
     stream_epoch: u64,
     clamp_to_media: bool,
     frame_pool: Arc<FramePool>,
@@ -1425,16 +1635,16 @@ pub(crate) fn video_decode_thread(
         start_before
     };
     {
-        let mut ctl = video_control.lock_unpoisoned();
+        let mut guard = video_control.lock_unpoisoned();
+        let paused = guard.paused;
+        let ctl = &mut guard.layers[layer];
         if ctl.stream_epoch == stream_epoch {
             ctl.media_length_secs = media_length_secs;
             if let (Some(requested), Some(actual)) = (start_before, seek_target)
                 && requested != actual
             {
                 let now = Instant::now();
-                if let Some((clock, pause_started)) =
-                    crate::video_seek_clock(now, actual, ctl.paused)
-                {
+                if let Some((clock, pause_started)) = crate::video_seek_clock(now, actual, paused) {
                     ctl.clock = Some(clock);
                     ctl.pause_started = pause_started;
                     if ctl.hold_position.is_some() {
