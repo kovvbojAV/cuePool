@@ -4,7 +4,10 @@ use crate::frame::{BitDepth, ChromaSubsample, VideoFrame, YuvPlane};
 use ffmpeg_next::Packet;
 use ffmpeg_next::{codec, color, ffi, format, frame, media::Type, software::scaling, threading};
 use hap_parser::{HapFrame, TextureFormat as HapFormat};
-use notchlc_rs::{Header as NotchLcHeader, Payload as NotchLcPayload, bit_offsets, decompress_packet, parse_header};
+use notchlc_rs::{
+    Header as NotchLcHeader, Payload as NotchLcPayload, bit_offsets, decompress_packet,
+    parse_header,
+};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -716,7 +719,10 @@ impl VideoSource {
             VideoBackend::Hap(source) => source.last_timings,
             VideoBackend::NotchLc(source) => source.last_timings,
         };
-        if matches!(&self.backend, VideoBackend::Hap(_) | VideoBackend::NotchLc(_)) {
+        if matches!(
+            &self.backend,
+            VideoBackend::Hap(_) | VideoBackend::NotchLc(_)
+        ) {
             timings.decode += self.fallback_decode_time;
         }
         timings
@@ -1384,7 +1390,11 @@ impl NotchLcVideoSource {
 
     fn frame_from(&mut self, prepared: NotchLcPrepared, pts: Option<f64>, step: f64) -> VideoFrame {
         let pts = pts.unwrap_or(self.next_pts);
-        let step = if step > 0.0 { step } else { self.frame_duration };
+        let step = if step > 0.0 {
+            step
+        } else {
+            self.frame_duration
+        };
         self.next_pts = pts + step.max(0.0);
         VideoFrame::notchlc(
             self.width,

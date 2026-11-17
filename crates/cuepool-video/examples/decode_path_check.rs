@@ -8,7 +8,9 @@ use cuepool_video::{FramePool, VideoSource};
 use std::sync::Arc;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: decode_path_check <file>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: decode_path_check <file>");
     let mut src =
         VideoSource::open_with_pool_and_hap(&path, Arc::new(FramePool::new(0)), Some(16_384))
             .expect("open failed");

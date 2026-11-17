@@ -170,15 +170,27 @@ impl NotchLcConverter {
         // A dimension change means new textures, so the cached bind groups no
         // longer refer to anything this converter will draw.
         let dimensions = (frame.width, frame.height);
-        if self.decoder.as_ref().is_none_or(|(_, dims)| *dims != dimensions) {
-            self.decoder = Some((GpuDecoder::new(device, frame.width, frame.height), dimensions));
+        if self
+            .decoder
+            .as_ref()
+            .is_none_or(|(_, dims)| *dims != dimensions)
+        {
+            self.decoder = Some((
+                GpuDecoder::new(device, frame.width, frame.height),
+                dimensions,
+            ));
             self.binds.clear();
         }
         let (decoder, _) = self.decoder.as_mut().expect("decoder just set");
         decoder.prepare(queue, payload, header, bit_offsets);
 
-        let (src_min, src_max, dst_min, dst_max) =
-            fit_rects(frame.width, frame.height, canvas_size[0], canvas_size[1], fit);
+        let (src_min, src_max, dst_min, dst_max) = fit_rects(
+            frame.width,
+            frame.height,
+            canvas_size[0],
+            canvas_size[1],
+            fit,
+        );
         // Unlike HAP there is no block padding, so the source rect needs no
         // rescaling — the decoded texture is exactly the logical frame.
         queue.write_buffer(
@@ -199,7 +211,12 @@ impl NotchLcConverter {
     ///
     /// Takes `&mut self` where [`crate::HapConverter::encode`] takes `&self`,
     /// because the decode picks the next texture in its ring.
-    pub fn encode(&mut self, device: &Device, encoder: &mut wgpu::CommandEncoder, canvas_view: &TextureView) {
+    pub fn encode(
+        &mut self,
+        device: &Device,
+        encoder: &mut wgpu::CommandEncoder,
+        canvas_view: &TextureView,
+    ) {
         if !self.staged {
             return;
         }
@@ -302,7 +319,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notchlc_rs::{bit_offsets, decompress_packet, parse_header, FrameEncoder};
+    use notchlc_rs::{FrameEncoder, bit_offsets, decompress_packet, parse_header};
 
     /// 8-bit -> 12-bit the way the codec expands stored endpoints.
     fn to12(v: u8) -> u16 {
@@ -359,7 +376,11 @@ mod tests {
             label: Some("notchlc-test-encoder"),
         });
         // Decode dispatch and fit pass both land in this one encoder.
-        converter.encode(&device, &mut encoder, &target.create_view(&Default::default()));
+        converter.encode(
+            &device,
+            &mut encoder,
+            &target.create_view(&Default::default()),
+        );
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
