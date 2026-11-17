@@ -5,6 +5,12 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/kovvbojAV/cuePool/compare/v0.13.5...v0.14.0) - 2026-11-17
+
+### Application features
+
+- *(cuepool)* GPU-native NotchLC playback ([#64](https://github.com/kovvbojAV/cuePool/pull/64))
+
 ## [0.13.5](https://github.com/kovvbojAV/cuePool/compare/v0.13.4...v0.13.5) - 2026-09-24
 
 ### Application fixes
