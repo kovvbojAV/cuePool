@@ -1,6 +1,6 @@
 # CuePool development
 
-CuePool is a standalone Cargo workspace. It was extracted from `examples/cuepool` in
+CuePool is a standalone Cargo workspace. It was extracted from the CuePool example in
 [rustjay-engine](https://github.com/BlueJayLouche/rustjay-engine); the only remaining tie is
 `rustjay-lighting`, consumed from crates.io. Local edits to that crate in the engine tree do not
 reach CuePool until they are published — bump the version in `Cargo.toml` to pick them up.
@@ -40,7 +40,7 @@ Do not derive the constant from `CARGO_PKG_VERSION`. That re-fires the modal on 
 
 ## Platform gating
 
-CuePool ships on macOS, Windows, and Linux, but any given author compiles only one. Rust does not typecheck `cfg`'d-out code, so platform divergence is invisible until another OS builds it — and "compiles everywhere, wrong on one platform" (e.g. a Windows-only audio driver presented on macOS) is invisible even then.
+CuePool releases on macOS and Windows and is compiled and tested on Linux in CI, but any given author compiles only one. Rust does not typecheck `cfg`'d-out code, so platform divergence is invisible until another OS builds it — and "compiles everywhere, wrong on one platform" (e.g. a Windows-only audio driver presented on macOS) is invisible even then.
 
 - Platform-specific user-facing options (drivers, hosts, APIs) must be gated to the platforms where they are meaningful. Make the platform decision once, in the crate that owns the type (e.g. `AUDIO_OUTPUT_DRIVER_OPTIONS` / `AudioOutputDriver::presented` in `cuepool-core`), and have every UI surface consume it — never hard-code a platform's option list in the GUI.
 - Keep platform code behind module-level `cfg` gates (a whole `mod`, e.g. `d3d11_zero_copy.rs`) rather than scattered inline flags.
@@ -51,17 +51,36 @@ CuePool ships on macOS, Windows, and Linux, but any given author compiles only o
 Run the focused checks first:
 
 ```sh
-cargo test -p cuepool-harness --tests
-cargo test -p cuepool
+cargo test -p cuepool-harness --tests --locked
+cargo test -p cuepool --locked
 ```
 
 Before opening a PR, run:
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 Headless tests cover show logic and decoder timing. They do not prove presentation cadence, vsync behavior, audio-device routing, protocols, lighting hardware, or projector output. Changes at those boundaries still need an attended binary or rig smoke test.
+
+## Build identity and releases
+
+`cuepool_core::build_identity::BUILD` owns source identity for all consumers.
+Do not reintroduce independent environment-variable reads in the GUI or API.
+Its build script intentionally checks Git on every Cargo invocation; preserve
+coverage for checkout changes, untracked files, worktrees, shallow clones and
+archives when changing it. Version tags do not prove publication; only matching
+`published/vX.Y.Z` receipts record confirmed releases.
+
+Use `fix(deps):` for application dependencies and `chore(deps):` for build tooling.
+Release-plz prepares one product release PR with an inherited workspace version;
+it must never publish internal crates or update unrelated dependencies. Invoke
+release-plz through `scripts/prepare-release.py` so it receives a verified Git
+baseline and the proposal checks run before creating a remote PR. Only
+`.github/workflows/release.yml` owns final GitHub publication, after the exact
+candidate passes CI and both platform packages are validated and read back.
+Do not bypass the minor-release welcome-copy gate when merging a release PR.
+See `docs/releases.md` for setup, retries and token-trigger rules.

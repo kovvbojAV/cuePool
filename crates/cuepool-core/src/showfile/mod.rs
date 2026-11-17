@@ -43,6 +43,36 @@ fn default_file_format_version() -> i32 {
     FILE_FORMAT_VERSION
 }
 
+/// Parse a `.qproj` document and bring it up to [`FILE_FORMAT_VERSION`].
+///
+/// Every load path must come through here. The migrators in [`migration`]
+/// read the raw JSON alongside the parsed struct (old key names, byte
+/// colours, the `halt` flag), so a bare `serde_json::from_str::<ShowFile>`
+/// silently skips them and loads serde defaults instead.
+///
+/// A file newer than this build is loaded as-is with a warning: unknown
+/// fields are ignored, and the version stamp is left alone so a re-save does
+/// not claim an older format than the file really has. Rejecting it would
+/// break the documented practice of running one show file across two builds
+/// during a cut-over.
+pub fn parse_show_file(data: &str) -> Result<ShowFile, serde_json::Error> {
+    let mut show: ShowFile = serde_json::from_str(data)?;
+    if show.file_format_version < FILE_FORMAT_VERSION {
+        let raw: serde_json::Value = serde_json::from_str(data)?;
+        log::info!(
+            "Upgrading show file from format {} to {FILE_FORMAT_VERSION}",
+            show.file_format_version
+        );
+        migration::upgrade_show_file(&mut show, &raw);
+    } else if show.file_format_version > FILE_FORMAT_VERSION {
+        log::warn!(
+            "Show file format {} is newer than this build's {FILE_FORMAT_VERSION}; unknown fields are ignored and will be dropped on save",
+            show.file_format_version
+        );
+    }
+    Ok(show)
+}
+
 /// Which sections "Import from Project…" copies into the open show.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ImportSections {
@@ -130,6 +160,10 @@ pub struct ShowSettings {
     pub audio_output_device: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limiter: Option<AudioLimiterSettings>,
+    /// Master output gain in dB, ahead of the limiter: the room trim. Set in
+    /// Project Settings or by OSC `/qplayer/volume`. 0 = unity.
+    #[serde(default)]
+    pub master_volume_db: f32,
 
     // OSC
     /// Deprecated, superseded by `osc_tx_host`. Never read at runtime: its only
@@ -270,6 +304,7 @@ impl Default for ShowSettings {
             audio_output_driver: AudioOutputDriver::default(),
             audio_output_device: String::new(),
             limiter: None,
+            master_volume_db: 0.0,
             osc_nic: String::new(),
             osc_tx_host: default_osc_tx_host(),
             osc_rx_port: default_osc_rx(),
@@ -472,6 +507,8 @@ impl std::fmt::Display for TimecodeFrameRate {
     }
 }
 
+/// Master-bus limiter. The engine reads `enabled` and `threshold` (dBFS);
+/// the other fields are carried for the show file and not applied yet.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct AudioLimiterSettings {
     #[serde(default)]
@@ -484,6 +521,53 @@ pub struct AudioLimiterSettings {
     pub attack: f32,
     #[serde(default)]
     pub release: f32,
+}
+
+impl AudioLimiterSettings {
+    /// Ceiling for a show with no limiter block: just under full scale, and a
+    /// round figure in the unit the settings window shows. (The engine's old
+    /// hard-coded 0.95 linear surfaced as an odd-looking −0.446 dB.)
+    pub const DEFAULT_THRESHOLD_DB: f32 = -0.5;
+}
+
+impl ShowSettings {
+    /// Limiter ceiling in dBFS. A disabled limiter reads as 0 dB, which the
+    /// engine treats as bypass.
+    pub fn limiter_threshold_db(&self) -> f32 {
+        match self.limiter {
+            None => AudioLimiterSettings::DEFAULT_THRESHOLD_DB,
+            Some(limiter) if !limiter.enabled => 0.0,
+            Some(limiter) => limiter.threshold,
+        }
+    }
+
+    pub fn set_limiter_threshold_db(&mut self, db: f32) {
+        let limiter = self.limiter.get_or_insert_default();
+        limiter.enabled = true;
+        limiter.threshold = db;
+    }
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    #[test]
+    fn limiter_ceiling_defaults_and_round_trips() {
+        let mut settings = ShowSettings::default();
+        assert_eq!(settings.limiter_threshold_db(), -0.5);
+        settings.set_limiter_threshold_db(-3.0);
+        assert_eq!(settings.limiter_threshold_db(), -3.0);
+        settings.limiter.as_mut().unwrap().enabled = false;
+        assert_eq!(settings.limiter_threshold_db(), 0.0, "disabled = bypass");
+    }
+
+    #[test]
+    fn older_show_files_load_at_unity() {
+        let settings: ShowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.master_volume_db, 0.0);
+        assert!(settings.limiter.is_none());
+    }
 }
 
 // Default helpers
@@ -692,5 +776,33 @@ mod tests {
         assert_eq!(t.show_settings.title, "Source");
         assert_eq!(t.projection, target.projection);
         assert_eq!(t.cues, target.cues, "cues are never imported");
+    }
+
+    #[test]
+    fn parse_show_file_migrates_an_old_file_and_stamps_the_current_version() {
+        let data = r#"{"file_format_version": 9, "show_settings": {"osc_nic": "10.0.1.20"}}"#;
+        let show = parse_show_file(data).unwrap();
+        assert_eq!(show.file_format_version, FILE_FORMAT_VERSION);
+        assert_eq!(show.show_settings.osc_tx_host, "10.0.1.255");
+    }
+
+    #[test]
+    fn parse_show_file_leaves_a_current_file_alone() {
+        let data = serde_json::to_string(&ShowFile::default()).unwrap();
+        let show = parse_show_file(&data).unwrap();
+        assert_eq!(show, ShowFile::default());
+    }
+
+    #[test]
+    fn parse_show_file_keeps_a_newer_version_stamp() {
+        let newer = FILE_FORMAT_VERSION + 1;
+        let data = format!(r#"{{"file_format_version": {newer}}}"#);
+        let show = parse_show_file(&data).unwrap();
+        assert_eq!(show.file_format_version, newer, "must not be downgraded");
+    }
+
+    #[test]
+    fn parse_show_file_reports_malformed_json() {
+        assert!(parse_show_file("{").is_err());
     }
 }

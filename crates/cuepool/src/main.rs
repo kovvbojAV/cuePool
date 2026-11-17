@@ -1,3 +1,6 @@
+// Release builds launched from Explorer must not open a terminal behind the UI.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! CuePool binary — custom winit event loop with native control, status, and output windows.
 //!
 //! - Control window: egui UI (replaces eframe)
@@ -73,6 +76,8 @@ mod settings;
 use settings::{AppProfile, load_settings, save_settings_from_state};
 mod video_pipeline;
 mod video_timing;
+#[cfg(windows)]
+mod windows_console;
 #[cfg(windows)]
 use video_pipeline::win_timer;
 use video_pipeline::{
@@ -366,6 +371,82 @@ fn unlatch_rewound_timecode_triggers(
     });
 }
 
+/// A take name from `/recorder/select` must be a bare file name. OSC is
+/// unauthenticated, and the recorder creates, renames and overwrites files at
+/// whatever path it is given; a path component here would let any host on
+/// the show LAN write anywhere the CuePool user can. The GUI's file pickers
+/// are the way to record to an arbitrary location.
+fn osc_take_file_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    let mut components = std::path::Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {}
+        _ => return None,
+    }
+    if trimmed.contains(['/', '\\']) {
+        return None;
+    }
+    let mut file = trimmed.to_string();
+    if !file.ends_with(".dmxrec") {
+        file.push_str(".dmxrec");
+    }
+    Some(file)
+}
+
+/// Wall-clock triggers due at `now`. A trigger is due when the clock is
+/// within a second of its target and it has not already fired for that
+/// target today (`fired` holds the last (date, target) each cue fired for).
+/// Comparing against the *target* rather than a cooldown closes the window
+/// where a cooldown expired while the clock was still within a second of
+/// the target, which fired the cue twice.
+fn due_wall_clock_cues(
+    cues: &[cuepool_core::Cue],
+    today: chrono::NaiveDate,
+    now: chrono::NaiveTime,
+    fired: &std::collections::HashMap<
+        rust_decimal::Decimal,
+        (chrono::NaiveDate, chrono::NaiveTime),
+    >,
+) -> Vec<(rust_decimal::Decimal, chrono::NaiveTime, String)> {
+    cues.iter()
+        .filter(|c| c.enabled())
+        .filter_map(|c| {
+            let trigger = c.base().triggers.wall_clock.as_ref()?;
+            let target = chrono::NaiveTime::parse_from_str(&trigger.time, "%H:%M:%S")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(&trigger.time, "%I:%M:%S %p"))
+                .ok()?;
+            if now.signed_duration_since(target).num_seconds().abs() > 1 {
+                return None;
+            }
+            let qid = c.base().qid;
+            match (fired.get(&qid), trigger.repeat) {
+                (Some(_), cuepool_core::RepeatMode::Once) => None,
+                (Some((date, at)), _) if *date == today && *at == target => None,
+                _ => Some((qid, target, trigger.time.clone())),
+            }
+        })
+        .collect()
+}
+
+/// Timecode triggers due at `elapsed` show seconds that have not fired.
+fn due_timecode_cues(
+    cues: &[cuepool_core::Cue],
+    elapsed: f64,
+    fired: &std::collections::HashSet<rust_decimal::Decimal>,
+) -> Vec<(rust_decimal::Decimal, f64)> {
+    cues.iter()
+        .filter(|c| c.enabled())
+        .filter_map(|c| {
+            let target = c.base().triggers.timecode.as_ref()?.time.as_secs_f64();
+            let qid = c.base().qid;
+            (elapsed >= target && !fired.contains(&qid)).then_some((qid, target))
+        })
+        .collect()
+}
+
 fn clamp_video_seek_secs(target: f64, length_secs: Option<f64>) -> f64 {
     match length_secs.filter(|length| length.is_finite() && *length > 0.0) {
         Some(length) => target.min(length.next_down()),
@@ -501,6 +582,9 @@ struct App {
     // ── app state ──
     cuepool: CuePoolApp,
     profile: AppProfile,
+    /// When to log the master/limiter levels after a change. Debounced so a
+    /// fader drag is one log line, not one per frame.
+    levels_log_due: Option<Instant>,
     show_engine: ShowEngine,
     engine_epoch: Instant,
     window_ids: Option<WindowIds>,
@@ -631,7 +715,8 @@ struct App {
     current_pixmap_qid: Option<rust_decimal::Decimal>,
 
     // ── trigger state ──
-    wall_clock_fired: std::collections::HashMap<rust_decimal::Decimal, Instant>,
+    wall_clock_fired:
+        std::collections::HashMap<rust_decimal::Decimal, (chrono::NaiveDate, chrono::NaiveTime)>,
     timecode_fired: std::collections::HashSet<rust_decimal::Decimal>,
 
     // ── polish ──
@@ -963,6 +1048,7 @@ impl App {
             egui_renderer: None,
             cuepool,
             profile,
+            levels_log_due: None,
             show_engine,
             engine_epoch: Instant::now(),
             window_ids: None,
@@ -2060,9 +2146,20 @@ impl App {
         target.trim() == local_name.trim() || target.trim() == "*"
     }
 
-    /// Apply the project's exact driver/device request. Any failure drops the
-    /// previous stream before reporting the error, so ASIO can never fall back
-    /// to WASAPI or continue through a stale device.
+    /// Push the show's master gain and limiter ceiling to the running engine.
+    /// A fresh engine starts at unity and 0.95, so this runs after every
+    /// rebuild and every show load as well as after an edit.
+    fn apply_audio_levels(&mut self) {
+        if let Some(audio) = self.show_engine.audio_engine() {
+            cuepool::master_volume::apply_to_engine(self.cuepool.state(), audio);
+        }
+        self.levels_log_due
+            .get_or_insert(Instant::now() + Duration::from_secs(1));
+    }
+
+    /// Apply the project's audio settings: open the requested driver/device if
+    /// it is not already the one running, then push the master and limiter
+    /// levels to whatever engine is running.
     fn apply_audio_settings(&mut self) {
         let (driver, configured_device, audio_ok) = {
             let state = self.cuepool.state().lock_unpoisoned();
@@ -2073,15 +2170,21 @@ impl App {
             )
         };
 
-        if audio_ok
+        let unchanged = audio_ok
             && self.show_engine.audio_engine().is_some_and(|engine| {
                 engine.driver() == driver
                     && (configured_device.is_empty() || configured_device == engine.device_name())
-            })
-        {
-            return;
+            });
+        if !unchanged {
+            self.rebuild_audio_engine(driver, &configured_device);
         }
+        self.apply_audio_levels();
+    }
 
+    /// Drop the current stream and open the exact driver/device request. Any
+    /// failure drops the previous stream before reporting the error, so ASIO
+    /// can never fall back to WASAPI or continue through a stale device.
+    fn rebuild_audio_engine(&mut self, driver: AudioOutputDriver, configured_device: &str) {
         let now = self.engine_now();
         let _ = self.show_engine.command(EngineCommand::Stop, now);
         self.stop_video_playback();
@@ -2089,7 +2192,7 @@ impl App {
         self.stop_external_outputs();
         self.show_engine.replace_audio_engine(None);
 
-        let setup = AudioEngine::configure(driver, &configured_device);
+        let setup = AudioEngine::configure(driver, configured_device);
         if let Some(error) = setup.device_list_error {
             log::error!("Could not list {driver} output devices: {error}");
         }
@@ -2114,14 +2217,14 @@ impl App {
                 log::info!("Applied {driver} audio output configuration");
             }
             Err(error) => {
-                let message = configured_audio_error(driver, &configured_device, &error);
+                let message = configured_audio_error(driver, configured_device, &error);
                 log::error!("{message}; audio playback is disabled");
                 let mut state = self.cuepool.state().lock_unpoisoned();
                 state.audio_devices = devices;
                 state.audio_device_name = if configured_device.is_empty() {
                     "<default>".to_string()
                 } else {
-                    configured_device
+                    configured_device.to_string()
                 };
                 state.audio_error = Some(message);
                 state.show_settings_window = true;
@@ -2984,6 +3087,21 @@ impl App {
         // <show.qproj>` startup loads and OSC-triggered saves (#138).
         let state = Arc::clone(self.cuepool.state());
         drain_app_commands(&state, |cmd| {
+            let cmd =
+                match cuepool::master_volume::process(&state, cmd, || self.apply_audio_levels()) {
+                    Ok(reply) => {
+                        if let Some((destination, message)) = reply
+                            && let Some(osc) = &self.osc_manager
+                            && let Err(error) = osc.send_to(message, destination)
+                        {
+                            log::warn!(
+                                "Could not send master-volume feedback to {destination}: {error}"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Err(cmd) => cmd,
+                };
             match cmd {
                 AppCommand::Go => {
                     let _ = self.execute_show_control(ShowControlCommand::Go, event_loop);
@@ -2998,15 +3116,6 @@ impl App {
                         ShowControlCommand::Pause
                     };
                     let _ = self.execute_show_control(command, event_loop);
-                }
-                AppCommand::SetLimiterThreshold(threshold) => {
-                    if let Some(audio) = self.show_engine.audio_engine() {
-                        audio.set_limiter_threshold(threshold);
-                        log::info!(
-                            "Set master limiter threshold to {:.2} dB",
-                            20.0 * threshold.log10()
-                        );
-                    }
                 }
                 AppCommand::SetAudioDriver(driver) => {
                     {
@@ -3290,42 +3399,22 @@ impl App {
     /// Poll wall-clock triggers and fire any cue whose scheduled time has arrived.
     fn poll_wall_clock_triggers(&mut self, event_loop: &ActiveEventLoop) {
         let now = chrono::Local::now();
-        let current = now.time();
-        let cues: Vec<_> = {
+        let due = {
             let Ok(state) = self.cuepool.state().lock() else {
                 return;
             };
-            state
-                .show_file
-                .cues
-                .iter()
-                .filter(|c| c.enabled())
-                .cloned()
-                .collect()
+            due_wall_clock_cues(
+                &state.show_file.cues,
+                now.date_naive(),
+                now.time(),
+                &self.wall_clock_fired,
+            )
         };
-
-        for cue in cues {
-            let Some(trigger) = cue.base().triggers.wall_clock.as_ref() else {
-                continue;
-            };
-            let parsed = chrono::NaiveTime::parse_from_str(&trigger.time, "%H:%M:%S")
-                .or_else(|_| chrono::NaiveTime::parse_from_str(&trigger.time, "%I:%M:%S %p"));
-            let Ok(target) = parsed else { continue };
-
-            let diff = current.signed_duration_since(target).num_seconds().abs();
-            if diff <= 1 {
-                let qid = cue.base().qid;
-                let should_fire = self
-                    .wall_clock_fired
-                    .get(&qid)
-                    .map(|t| t.elapsed() > Duration::from_secs(2))
-                    .unwrap_or(true);
-                if should_fire {
-                    log::info!("Wall-clock trigger fired Q{} at {}", qid, trigger.time);
-                    self.wall_clock_fired.insert(qid, Instant::now());
-                    self.play_cue_by_qid(qid, event_loop);
-                }
-            }
+        for (qid, target, text) in due {
+            log::info!("Wall-clock trigger fired Q{} at {}", qid, text);
+            self.wall_clock_fired
+                .insert(qid, (now.date_naive(), target));
+            self.play_cue_by_qid(qid, event_loop);
         }
     }
 
@@ -3384,36 +3473,27 @@ impl App {
             state.pending_timecode_capture = None;
         }
 
-        let cues: Vec<_> = {
+        let due = {
             let Ok(state) = self.cuepool.state().lock() else {
                 return;
             };
-            state.show_file.cues.clone()
+            unlatch_rewound_timecode_triggers(
+                &mut self.timecode_fired,
+                &state.show_file.cues,
+                elapsed,
+            );
+            // Frozen clock: never fire while paused (a just-captured or
+            // stepped-past trigger would fire instantly). Anything passed by
+            // stepping fires on resume.
+            if self.paused {
+                return;
+            }
+            due_timecode_cues(&state.show_file.cues, elapsed, &self.timecode_fired)
         };
-
-        unlatch_rewound_timecode_triggers(&mut self.timecode_fired, &cues, elapsed);
-
-        // Frozen clock: never fire while paused (a just-captured or stepped-past
-        // trigger would fire instantly). Anything passed by stepping fires on
-        // resume.
-        if self.paused {
-            return;
-        }
-
-        for cue in cues {
-            if !cue.enabled() {
-                continue;
-            }
-            let Some(trigger) = cue.base().triggers.timecode.as_ref() else {
-                continue;
-            };
-            let qid = cue.base().qid;
-            let target = trigger.time.as_secs_f64();
-            if elapsed >= target && !self.timecode_fired.contains(&qid) {
-                log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target);
-                self.timecode_fired.insert(qid);
-                self.play_cue_by_qid(qid, event_loop);
-            }
+        for (qid, target) in due {
+            log::info!("Timecode trigger fired Q{} at {:.2}s", qid, target);
+            self.timecode_fired.insert(qid);
+            self.play_cue_by_qid(qid, event_loop);
         }
     }
 
@@ -3422,6 +3502,10 @@ impl App {
         if let Some(rx) = &self.osc_rx {
             while let Ok(ev) = rx.try_recv() {
                 log::debug!("OSC event: {ev:?}");
+                let ev = match cuepool::master_volume::enqueue(self.cuepool.state(), ev) {
+                    Ok(()) => continue,
+                    Err(ev) => ev,
+                };
                 match ev {
                     OscEvent::Go { qid } => {
                         if let Some(qid_str) = qid
@@ -3519,16 +3603,17 @@ impl App {
                                 .push(AppCommand::RecorderRevert { file });
                         }
                     }
-                    OscEvent::RecorderSelect { name } => {
-                        let mut file = name;
-                        if !file.ends_with(".dmxrec") {
-                            file.push_str(".dmxrec");
+                    OscEvent::RecorderSelect { name } => match osc_take_file_name(&name) {
+                        Some(file) => {
+                            if let Ok(mut state) = self.cuepool.state().lock() {
+                                log::info!("Recorder: selected take '{file}' via OSC");
+                                state.recorder_file = file;
+                            }
                         }
-                        if let Ok(mut state) = self.cuepool.state().lock() {
-                            log::info!("Recorder: selected take '{file}' via OSC");
-                            state.recorder_file = file;
-                        }
-                    }
+                        None => log::warn!(
+                            "Recorder: ignoring take name {name:?} from OSC; it must be a bare file name"
+                        ),
+                    },
                     OscEvent::AutoblendStream { url } => {
                         self.autoblend.stream(&url);
                     }
@@ -3722,6 +3807,16 @@ impl App {
                     _ => {}
                 }
             }
+        }
+
+        if self.levels_log_due.is_some_and(|due| Instant::now() >= due) {
+            self.levels_log_due = None;
+            let (master, limiter) = {
+                let state = self.cuepool.state().lock_unpoisoned();
+                let settings = &state.show_file.show_settings;
+                (settings.master_volume_db, settings.limiter_threshold_db())
+            };
+            log::info!("Master volume {master:+.1} dB, limiter ceiling {limiter:+.1} dB");
         }
 
         // Discovery broadcast every 1 second
@@ -5108,8 +5203,7 @@ fn resolve_cli_project_path(path: &Path, cwd: &Path) -> Result<PathBuf, String> 
     Ok(resolved)
 }
 
-const CLI_USAGE: &str =
-    "Usage: cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]";
+const CLI_USAGE: &str = "Usage: cuepool [--show-mode] [--zero-copy | --no-zero-copy] [--project <path> | <path>]\n       cuepool --version";
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
@@ -5229,6 +5323,24 @@ fn optional_feature_candidates(
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from("--version")])
+    {
+        #[cfg(windows)]
+        windows_console::attach_parent_for_cli();
+        println!("CuePool {}", cuepool_core::build_identity::BUILD.display);
+        println!(
+            "ASIO: {}",
+            if cfg!(all(windows, feature = "asio")) {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        return Ok(());
+    }
+
     let profile = AppProfile::from_env()
         .map_err(|message| startup_error("Could not start CuePool", message))?;
     let log_file = match cuepool_gui::logging::init_logger(&profile.persistent_log_path()) {
@@ -5239,7 +5351,7 @@ fn main() -> anyhow::Result<()> {
     human_panic::setup_panic!(
         Metadata::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .authors("CuePool Contributors")
-            .homepage("https://github.com/BlueJayLouche/CuePool")
+            .homepage("https://github.com/kovvbojAV/cuePool")
     );
     let human_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -5594,6 +5706,122 @@ mod tests {
         };
         unlatch_rewound_timecode_triggers(&mut fired, &[plain], 42.0);
         assert!(fired.is_empty());
+    }
+
+    fn wall_clock_cue(qid: i64, time: &str, repeat: cuepool_core::RepeatMode) -> cuepool_core::Cue {
+        let mut base = cuepool_core::CueBase {
+            qid: rust_decimal::Decimal::from(qid),
+            ..Default::default()
+        };
+        base.triggers.wall_clock = Some(cuepool_core::WallClockTrigger {
+            time: time.to_string(),
+            mode: Default::default(),
+            repeat,
+        });
+        cuepool_core::Cue::Dummy { base }
+    }
+
+    #[test]
+    fn a_wall_clock_trigger_fires_once_per_target_even_across_the_whole_window() {
+        use chrono::{NaiveDate, NaiveTime};
+        let qid = rust_decimal::Decimal::from(3);
+        let cues = vec![wall_clock_cue(
+            3,
+            "20:00:00",
+            cuepool_core::RepeatMode::Daily,
+        )];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let mut fired = std::collections::HashMap::new();
+
+        // 1.9 s early: inside the window, fires.
+        let early = NaiveTime::from_hms_milli_opt(19, 59, 58, 100).unwrap();
+        let due = due_wall_clock_cues(&cues, today, early, &fired);
+        assert_eq!(due.len(), 1);
+        fired.insert(qid, (today, target));
+
+        // 1.5 s late: still inside the window; the old cooldown would refire.
+        let late = NaiveTime::from_hms_milli_opt(20, 0, 1, 500).unwrap();
+        assert!(due_wall_clock_cues(&cues, today, late, &fired).is_empty());
+
+        // Next day, same time: fires again (Daily).
+        let tomorrow = today.succ_opt().unwrap();
+        assert_eq!(
+            due_wall_clock_cues(&cues, tomorrow, target, &fired).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_once_wall_clock_trigger_never_fires_a_second_day() {
+        use chrono::{NaiveDate, NaiveTime};
+        let qid = rust_decimal::Decimal::from(3);
+        let cues = vec![wall_clock_cue(
+            3,
+            "20:00:00",
+            cuepool_core::RepeatMode::Once,
+        )];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let target = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let fired = std::collections::HashMap::from([(qid, (today, target))]);
+        let tomorrow = today.succ_opt().unwrap();
+        assert!(due_wall_clock_cues(&cues, tomorrow, target, &fired).is_empty());
+    }
+
+    #[test]
+    fn twelve_hour_and_disabled_wall_clock_triggers_are_handled() {
+        use chrono::{NaiveDate, NaiveTime};
+        let mut disabled = wall_clock_cue(4, "08:00:00 PM", cuepool_core::RepeatMode::Daily);
+        disabled.base_mut().enabled = false;
+        let cues = vec![
+            wall_clock_cue(3, "08:00:00 PM", cuepool_core::RepeatMode::Daily),
+            disabled,
+        ];
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let at = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+        let due = due_wall_clock_cues(&cues, today, at, &Default::default());
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].0, rust_decimal::Decimal::from(3));
+    }
+
+    #[test]
+    fn timecode_triggers_come_due_once_and_skip_disabled_cues() {
+        let mut off = timecode_cue(8, 2.0);
+        off.base_mut().enabled = false;
+        let cues = vec![timecode_cue(7, 5.0), off, timecode_cue(9, 9.0)];
+        let mut fired = std::collections::HashSet::new();
+        assert!(due_timecode_cues(&cues, 4.9, &fired).is_empty());
+        let due = due_timecode_cues(&cues, 5.0, &fired);
+        assert_eq!(due, vec![(rust_decimal::Decimal::from(7), 5.0)]);
+        fired.insert(rust_decimal::Decimal::from(7));
+        assert!(due_timecode_cues(&cues, 6.0, &fired).is_empty());
+    }
+
+    #[test]
+    fn osc_take_names_are_bare_file_names() {
+        assert_eq!(osc_take_file_name("act1").as_deref(), Some("act1.dmxrec"));
+        assert_eq!(
+            osc_take_file_name("act1.dmxrec").as_deref(),
+            Some("act1.dmxrec")
+        );
+        assert_eq!(
+            osc_take_file_name("  act1 ").as_deref(),
+            Some("act1.dmxrec")
+        );
+        for bad in [
+            "",
+            "   ",
+            "..",
+            "../x",
+            "/tmp/x",
+            "a/b",
+            "a\\b",
+            "C:\\x",
+            "\\\\srv\\share\\x",
+            "a\0b",
+        ] {
+            assert!(osc_take_file_name(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

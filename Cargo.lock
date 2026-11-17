@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-audio"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "cpal",
  "crossbeam",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-core"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "chrono",
  "flate2",
@@ -1386,12 +1386,11 @@ dependencies = [
  "rustjay-lighting",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "cuepool-gui"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "chrono",
  "cuepool-audio",
@@ -1400,7 +1399,6 @@ dependencies = [
  "eframe",
  "egui",
  "egui-wgpu",
- "egui-winit",
  "egui_kittest",
  "env_logger",
  "if-addrs",
@@ -1417,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-harness"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "cuepool",
@@ -1433,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-protocols"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -1444,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "cuepool-video"
-version = "0.12.2"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "apriltag",
@@ -1460,7 +1458,6 @@ dependencies = [
  "log",
  "notchlc-rs",
  "pollster 0.3.0",
- "thiserror 2.0.20",
  "wgpu",
  "windows 0.62.2",
  "winit",
@@ -4393,9 +4390,9 @@ dependencies = [
 
 [[package]]
 name = "ringbuf"
-version = "0.4.8"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
+checksum = "0b123165531e325df9079f56c036f2da4103a5d5abfef9e2fda4b9c34d1ef7aa"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",

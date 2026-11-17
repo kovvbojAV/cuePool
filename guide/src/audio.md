@@ -3,8 +3,17 @@
 CuePool decodes with [symphonia](https://github.com/pdeljanov/Symphonia)
 (all formats enabled — WAV, FLAC, MP3, OGG/Vorbis, AAC, ALAC, …), resamples
 to the device rate, and mixes every playing cue through a per-cue DSP chain
-(fade → EQ → pan → routing) into a master bus with metering and an optional
-limiter. Output is via cpal.
+(fade → EQ → pan → routing) into a master bus with a master gain, metering,
+and an optional limiter. Output is via cpal.
+
+The master gain is the room trim: **Master Volume** in *Project Settings →
+Audio* (double-click for 0 dB), or [`/qplayer/volume`](show-control.md#osc) from
+a venue control system. Both edit the same show setting. It sits ahead of the
+limiter, ranges −96 dB (silence) to +12 dB, and is saved **with the show**.
+Loading another show loads its gain; rebuilding an audio device reapplies the
+current show's gain. The status bar indicates a nonzero master level and opens
+Project Settings when clicked. Each settled change is reported in *Window →
+Log*. Controllers can [query and confirm the setting](show-control.md#master-volume-feedback).
 
 ## Project audio settings
 
@@ -17,6 +26,7 @@ limiter. Output is via cpal.
 | Latency | Requested output latency in ms (default 10). |
 | Channel offset | Shift all output channels — useful on interfaces where outputs 1-2 are not the mains. |
 | Exclusive mode | Windows-only output preference. |
+| Master Volume | Overall programme gain, −96 to +12 dB; 0 dB is unity. Saved with the show. |
 | Limiter | Master-bus brick-wall limiter: input gain, threshold, attack, release. |
 
 `WASAPI`, `Wave`, and `DirectSound` are retained as legacy show-file values
@@ -79,6 +89,7 @@ low-pass filters, edited in the Inspector.
 
 ## Metering & waveform
 
-The transport bar shows the master meter; each entry in **Active Cues** has
+The transport bar shows the master meter and the status bar indicates master gain when it is away from 0 dB;
+each entry in **Active Cues** has
 its own meter. *Window → Waveform* opens a waveform view of the selected
 sound cue — handy when setting start/duration trims.
