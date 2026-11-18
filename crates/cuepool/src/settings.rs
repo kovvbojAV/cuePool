@@ -1,11 +1,13 @@
 use cuepool_core::LockExt;
 use cuepool_gui::SharedStateHandle;
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
     pub(crate) recent_files: Vec<std::path::PathBuf>,
     pub(crate) last_seen_release_notes: Option<String>,
+    /// Reopen the most recent project when CuePool starts without one.
+    pub(crate) open_last_project: bool,
 }
 
 pub(crate) const AUTOMATION_PROFILE_ENV: &str = "CUEPOOL_AUTOMATION_PROFILE";
@@ -158,7 +160,7 @@ pub(crate) fn save_settings(profile: &AppProfile, settings: &AppSettings) {
 /// Snapshot the persistable settings out of shared state. Split out from
 /// [`save_settings_from_state`] so the poison behaviour is testable without
 /// touching the filesystem, and so the guard drops before the write.
-fn settings_from_state(state: &SharedStateHandle) -> AppSettings {
+pub(crate) fn settings_from_state(state: &SharedStateHandle) -> AppSettings {
     // lock_unpoisoned: a poisoned state lock must not fall back to defaults
     // here — save_settings would overwrite the user's settings.json with them,
     // erasing recent_files and re-showing the release notes. Recovered state
@@ -167,6 +169,7 @@ fn settings_from_state(state: &SharedStateHandle) -> AppSettings {
     AppSettings {
         recent_files: state.recent_files.clone(),
         last_seen_release_notes: state.last_seen_release_notes.clone(),
+        open_last_project: state.open_last_project,
     }
 }
 
@@ -238,6 +241,7 @@ mod tests {
         AppSettings {
             recent_files: vec![std::path::PathBuf::from("/shows/gala.qproj")],
             last_seen_release_notes: Some("9.9.9".into()),
+            open_last_project: true,
         }
     }
 
@@ -249,8 +253,7 @@ mod tests {
         save_settings_at(&path, &populated());
         let loaded = load_settings_at(&path);
 
-        assert_eq!(loaded.recent_files, populated().recent_files);
-        assert_eq!(loaded.last_seen_release_notes.as_deref(), Some("9.9.9"));
+        assert_eq!(loaded, populated());
     }
 
     static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -364,6 +367,7 @@ mod tests {
         let settings: AppSettings = serde_json::from_str(r#"{"recent_files": []}"#).unwrap();
 
         assert_eq!(settings.last_seen_release_notes, None);
+        assert!(!settings.open_last_project, "reopening is opt-in");
     }
 
     #[test]
