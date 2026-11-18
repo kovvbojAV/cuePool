@@ -57,6 +57,7 @@ use ltc_source::{LtcReceiver, to_mtc_frame_rate};
 mod macos_quit;
 mod mtc_follow;
 use mtc_follow::MtcFollowState;
+mod output_fullscreen;
 mod output_window;
 use output_window::{
     OutputWindow, WindowIds, monitor_descriptor, pack_size, projection_structure_changed,
@@ -4487,21 +4488,14 @@ impl ApplicationHandler<AppEvent> for App {
                         {
                             // Esc always exits fullscreen
                             if is_esc {
-                                out.window.set_fullscreen(None);
+                                output_fullscreen::set_fullscreen(&out.window, false);
                                 out.window.set_cursor_visible(true);
                             }
                             // F11, Ctrl+F, or Cmd+F toggles fullscreen
                             else if is_f11 || (is_f && has_ctrl) {
-                                let currently = out.window.fullscreen().is_some();
-                                if currently {
-                                    out.window.set_fullscreen(None);
-                                    out.window.set_cursor_visible(true);
-                                } else {
-                                    out.window.set_fullscreen(Some(
-                                        winit::window::Fullscreen::Borderless(None),
-                                    ));
-                                    out.window.set_cursor_visible(false);
-                                }
+                                let fullscreen = !output_fullscreen::is_fullscreen(&out.window);
+                                output_fullscreen::set_fullscreen(&out.window, fullscreen);
+                                out.window.set_cursor_visible(!fullscreen);
                             }
                         }
 
@@ -5002,7 +4996,7 @@ impl ApplicationHandler<AppEvent> for App {
                             .and_then(|m| m.refresh_rate_millihertz())
                             .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
                             .unwrap_or_else(|| "?".into()),
-                        fullscreen: out.window.fullscreen().is_some(),
+                        fullscreen: output_fullscreen::is_fullscreen(&out.window),
                         presented_per_sec,
                     }
                 })

@@ -151,16 +151,12 @@ fn output_runtime_role(configured_index: usize, active_outputs: usize) -> (usize
 impl App {
     /// Toggle fullscreen on all output windows and update cursor visibility.
     pub(crate) fn toggle_output_fullscreen(&self) {
-        for out in &self.output_windows {
-            let currently_fullscreen = out.window.fullscreen().is_some();
-            if currently_fullscreen {
-                out.window.set_fullscreen(None);
-                out.window.set_cursor_visible(true);
-            } else {
-                out.window
-                    .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-                out.window.set_cursor_visible(false);
-            }
+        // Reverse creation order: on macOS each window restores the menu-bar
+        // options it saw on entry, so the first one in must be the last out.
+        for out in self.output_windows.iter().rev() {
+            let fullscreen = !crate::output_fullscreen::is_fullscreen(&out.window);
+            crate::output_fullscreen::set_fullscreen(&out.window, fullscreen);
+            out.window.set_cursor_visible(!fullscreen);
         }
     }
 
@@ -246,12 +242,9 @@ impl App {
                 .with_title(format!("CuePool Output {}", output.name))
                 .with_visible(true);
 
-            if let Some(mon_idx) = assigned[out_idx] {
-                if let Some(monitor) = monitors.get(mon_idx) {
-                    attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(
-                        Some(monitor.clone()),
-                    )));
-                }
+            let on_monitor = assigned[out_idx].and_then(|idx| monitors.get(idx));
+            if let Some(monitor) = on_monitor {
+                attrs = crate::output_fullscreen::on_monitor(attrs, monitor);
             } else {
                 let aspect = output.output_height.max(1) as f64 / output.output_width.max(1) as f64;
                 let h = (tile_w * aspect).min(screen_h * 0.7);
@@ -263,7 +256,13 @@ impl App {
             }
 
             let window = match event_loop.create_window(attrs) {
-                Ok(window) => Arc::new(window),
+                Ok(window) => {
+                    // Before the surface reads the size: fullscreen sets it.
+                    if on_monitor.is_some() {
+                        crate::output_fullscreen::enter_after_create(&window);
+                    }
+                    Arc::new(window)
+                }
                 Err(error) => {
                     record_output_failure(
                         &mut failed_outputs,
@@ -371,7 +370,7 @@ impl App {
                     config.present_mode,
                     config.format,
                     refresh,
-                    window.fullscreen().is_some(),
+                    crate::output_fullscreen::is_fullscreen(&window),
                 );
             }
 
