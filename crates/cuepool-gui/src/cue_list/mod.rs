@@ -879,6 +879,9 @@ fn trigger_badges(triggers: &cuepool_core::CueTriggers) -> Vec<&'static str> {
     if triggers.wall_clock.is_some() {
         badges.push("clk");
     }
+    if triggers.time_window.is_some() {
+        badges.push("win");
+    }
     if triggers.timecode.is_some() {
         badges.push("tc");
     }
@@ -920,6 +923,9 @@ fn describe_triggers(triggers: &cuepool_core::CueTriggers, tc_fps: f32) -> Strin
             s.push_str(&format!(" ({})", opts.join(", ")));
         }
         parts.push(s);
+    }
+    if let Some(window) = &triggers.time_window {
+        parts.push(format!("Time window {}–{}", window.from, window.to));
     }
     if let Some(tc) = &triggers.timecode {
         parts.push(format!(
