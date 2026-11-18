@@ -1523,6 +1523,37 @@ fn triggers_editor(
         }
     }
 
+    // Time window
+    {
+        let mut enabled = triggers.time_window.is_some();
+        if ui
+            .checkbox(&mut enabled, "Time Window")
+            .on_hover_text(
+                "Daily on-air window. While the clock is inside it the cue fires once, \
+                 even if CuePool starts late, and it stops at To. To at or before From \
+                 wraps past midnight.",
+            )
+            .changed()
+        {
+            *changed = true;
+            triggers.time_window = enabled.then(|| cuepool_core::TimeWindowTrigger {
+                from: "09:00:00".into(),
+                to: "17:00:00".into(),
+                mode: cuepool_core::ClockMode::TwentyFourHour,
+            });
+        }
+        if let Some(window) = triggers.time_window.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("From:");
+                *changed |= ui.text_edit_singleline(&mut window.from).changed();
+            });
+            ui.horizontal(|ui| {
+                ui.label("To:");
+                *changed |= ui.text_edit_singleline(&mut window.to).changed();
+            });
+        }
+    }
+
     // Timecode
     {
         let mut enabled = triggers.timecode.is_some();

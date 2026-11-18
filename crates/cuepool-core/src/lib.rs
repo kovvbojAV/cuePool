@@ -21,7 +21,7 @@ pub use cue::{
 };
 pub use cue::{
     ClockMode, CueTriggers, FadeType, HotkeyTrigger, LoopMode, MidiTrigger, MidiTriggerKind,
-    RepeatMode, StopMode, TimecodeTrigger, TriggerMode, WallClockTrigger,
+    RepeatMode, StopMode, TimeWindowTrigger, TimecodeTrigger, TriggerMode, WallClockTrigger,
 };
 pub use eq::{EQBand, EQBandShape, EQFilter, EQFilterOrder, EQSettings};
 pub use lighting::{
