@@ -27,6 +27,7 @@ impl Fixture {
         fs::create_dir(&dir)?;
         write_wav(&dir.join("tone.wav"), 4_800)?;
         write_y4m(&dir.join("video.y4m"), 5)?;
+        write_y4m(&dir.join("video-short.y4m"), 3)?;
         write_hap(&dir.join("video-hapq.mov"), 5)?;
         let show = ShowFile {
             cues,
