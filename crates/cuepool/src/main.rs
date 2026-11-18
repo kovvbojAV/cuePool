@@ -2339,6 +2339,9 @@ impl App {
         event_loop: &ActiveEventLoop,
     ) {
         let layer = &mut self.video_layers[li];
+        // The same cue starting again on its layer (a loop or group-loop
+        // pass) keeps its last frame up until the new stream's first frame.
+        let restart = layer.qid == Some(qid);
         // A fresh cue gets a fresh retry budget.
         layer.open_retries = 0;
         if layer.hap_fallback_instance_id != Some(instance_id) {
@@ -2372,9 +2375,11 @@ impl App {
             stream.pause_started = None;
             stream.peek_pts = None;
             stream.last_pts = None;
-            // Not drawn until its first frame: the previous clip's last frame
-            // on this layer must not linger.
-            stream.canvas_has_frame = false;
+            // A different clip is not drawn until its first frame, so the
+            // previous clip's last frame on this layer does not linger.
+            if !restart {
+                stream.canvas_has_frame = false;
+            }
             stream.media_length_secs =
                 (duration.as_secs_f64() > 0.0).then(|| media_offset + duration.as_secs_f64());
             stream.timeline_offset_secs = media_offset;

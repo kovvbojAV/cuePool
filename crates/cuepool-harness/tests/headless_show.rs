@@ -747,3 +747,53 @@ fn stopping_one_video_layer_keeps_the_other_presenting() {
     assert!(!layers.is_empty(), "layer 1 kept presenting");
     assert!(layers.iter().all(|layer| *layer == 1));
 }
+
+/// Two clips of different lengths in a looping group: the shorter one holds
+/// its last frame, and every pass starts both on frame 1 in the same block.
+#[test]
+fn a_looping_group_restarts_both_layers_on_the_same_first_frame() {
+    let member = |qid: i64, layer: u8, path: &str| {
+        let mut cue = layered_video(qid, layer, TriggerMode::Go, LoopMode::OneShot);
+        cue.base_mut().parent = Some(Decimal::ONE);
+        if let cuepool_core::Cue::Video {
+            path: p, duration, ..
+        } = &mut cue
+        {
+            *p = path.into();
+            *duration = cuepool_core::Timespan::ZERO;
+        }
+        cue
+    };
+    let mut group = base(1, TriggerMode::Go);
+    group.loop_mode = LoopMode::LoopedInfinite;
+    let fixture = Fixture::new(vec![
+        cuepool_core::Cue::Group { base: group },
+        member(2, 1, "video.y4m"),
+        member(3, 2, "video-short.y4m"),
+    ])
+    .unwrap();
+    let mut runner = HeadlessShowRunner::open(&fixture.project).unwrap();
+    runner.select(Decimal::ONE).unwrap();
+    runner.go().unwrap();
+
+    let mut first_frames = 0;
+    for _ in 0..70 {
+        runner.advance_blocks(1).unwrap();
+        let frames = layered_pts(&runner.take_trace());
+        let starts: Vec<u8> = frames.iter().filter(|f| f.1 == 0.0).map(|f| f.0).collect();
+        if !starts.is_empty() {
+            assert_eq!(starts, vec![1, 2], "a pass started on one layer only");
+            first_frames += 1;
+        }
+        assert!(
+            frames.iter().all(|f| f.0 != 2 || f.1 <= 0.08),
+            "the short clip has three frames"
+        );
+        assert_eq!(
+            runner.snapshot().videos.len(),
+            2,
+            "the short clip held, not stopped"
+        );
+    }
+    assert!(first_frames >= 3, "only {first_frames} passes started");
+}
