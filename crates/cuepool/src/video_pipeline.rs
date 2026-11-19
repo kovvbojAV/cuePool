@@ -6,7 +6,7 @@ use cuepool_gui::{SharedStateHandle, VideoDiagnostics, VideoTimings};
 use cuepool_video::{
     FramePool, HapAcceleration, HapFallbackSession, VideoFrame, VideoSource, ZeroCopyAvailability,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use winit::window::WindowId;
@@ -339,6 +339,10 @@ fn update_vsync_interval(
         .clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX)
 }
 
+/// Consume-loop passes allowed to have GPU work outstanding before new frames
+/// are dropped instead of uploaded.
+const MAX_GPU_PASSES_IN_FLIGHT: usize = 2;
+
 /// One video layer's consume-thread state: its decode channel, peeked
 /// frame, converters and region-sized texture. Moved out for each pass of
 /// the consume loop and put back after it.
@@ -392,6 +396,8 @@ pub(crate) fn video_consume_thread(
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
     let mut layers: [LayerState; VIDEO_LAYERS] = Default::default();
     let mut compositor: Option<cuepool_video::LayerCompositor> = None;
+    // Consume-loop passes whose GPU work has not finished yet.
+    let gpu_in_flight = Arc::new(AtomicUsize::new(0));
     // Layers (index, region, opacity) drawn by the last composite; any change
     // (a layer starting/stopping, a region edit, a fade step) recomposites.
     let mut last_drawn: Vec<(usize, CanvasRect, f32)> = Vec::new();
@@ -504,6 +510,17 @@ pub(crate) fn video_consume_thread(
         }
 
         let mut composite_dirty = views_dirty;
+        let mut submitted_gpu_work = false;
+        // Every upload holds a staging copy until the GPU has used it. When the
+        // GPU falls behind (two 4K60 layers plus two 4K outputs on an M1),
+        // queuing regardless ballooned memory into swap and stalled every
+        // output; dropping the frame instead keeps the backlog bounded.
+        if gpu_in_flight.load(Ordering::Acquire) >= MAX_GPU_PASSES_IN_FLIGHT {
+            // Deliver completion callbacks even if nothing else is submitting
+            // (no output windows open); non-blocking, and only while behind.
+            let _ = device.poll(wgpu::PollType::Poll);
+        }
+        let gpu_backlog = gpu_in_flight.load(Ordering::Acquire) >= MAX_GPU_PASSES_IN_FLIGHT;
         // Shortest wait any live layer asks for; idle/paused falls back to 2 ms.
         let mut next_wake: Option<Duration> = None;
 
@@ -732,6 +749,10 @@ pub(crate) fn video_consume_thread(
                         _ => break, // next frame not due yet, or channel empty
                     }
                 }
+            }
+            if gpu_backlog && let Some(frame) = consumed.take() {
+                frame_pool.recycle_frame(frame);
+                dropped += 1;
             }
             if dropped != 0 {
                 control.lock_unpoisoned().dropped += dropped;
@@ -1028,6 +1049,7 @@ pub(crate) fn video_consume_thread(
                     }
                 }
                 composite_dirty |= uploaded;
+                submitted_gpu_work |= uploaded;
                 let mut ctl = control.lock_unpoisoned();
                 if uploaded {
                     ctl.uploads += 1;
@@ -1193,7 +1215,19 @@ pub(crate) fn video_consume_thread(
                 // last conversion's encoder if conversion_submit timings regress.
                 queue.submit(std::iter::once(encoder.finish()));
                 last_drawn = drawn;
+                submitted_gpu_work = true;
             }
+        }
+
+        // Count this pass until the GPU finishes everything submitted so far.
+        // The callback fires from a later submit on the shared queue (the output
+        // threads submit every frame) or from the poll above.
+        if submitted_gpu_work {
+            gpu_in_flight.fetch_add(1, Ordering::AcqRel);
+            let done = Arc::clone(&gpu_in_flight);
+            queue.queue().on_submitted_work_done(move || {
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
         }
 
         // ── Publish the frame-state bundle (change-detect + generation bump) ──
