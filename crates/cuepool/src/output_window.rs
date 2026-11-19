@@ -258,8 +258,8 @@ impl App {
             let window = match event_loop.create_window(attrs) {
                 Ok(window) => {
                     // Before the surface reads the size: fullscreen sets it.
-                    if on_monitor.is_some() {
-                        crate::output_fullscreen::enter_after_create(&window);
+                    if let Some(monitor) = on_monitor {
+                        crate::output_fullscreen::enter_after_create(&window, monitor);
                     }
                     Arc::new(window)
                 }

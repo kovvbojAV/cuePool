@@ -15,22 +15,24 @@ pub(crate) use imp::{enter_after_create, is_fullscreen, on_monitor, set_fullscre
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use winit::platform::macos::WindowExtMacOS;
+    use winit::platform::macos::{MonitorHandleExtMacOS, WindowExtMacOS};
+    use winit::window::WindowLevel;
 
-    /// Open the window on `monitor`; [`enter_after_create`] makes it fullscreen.
+    /// Open the window near `monitor`; [`enter_after_create`] puts it on the
+    /// monitor's screen exactly and makes it fullscreen.
     pub(crate) fn on_monitor(attrs: WindowAttributes, monitor: &MonitorHandle) -> WindowAttributes {
-        // Logical (point) coordinates in the monitor's own scale, so mixed-DPI
-        // setups still land the window on the intended screen.
-        let scale = monitor.scale_factor();
-        attrs
-            .with_position(monitor.position().to_logical::<f64>(scale))
-            .with_inner_size(monitor.size().to_logical::<f64>(scale))
+        // No size: AppKit adjusts a titled window larger than its screen as it
+        // is shown. Simple fullscreen sets the size.
+        attrs.with_position(monitor.position().to_logical::<f64>(monitor.scale_factor()))
     }
 
-    /// Simple fullscreen covers whichever screen the window is on, so this
-    /// runs after [`on_monitor`] has placed it.
-    pub(crate) fn enter_after_create(window: &Window) {
-        window.set_simple_fullscreen(true);
+    /// Simple fullscreen covers whichever screen the window is on, so first
+    /// move it onto the monitor's own screen, as winit does before native
+    /// fullscreen. That uses AppKit's screen object rather than coordinates,
+    /// which put every output on the main projector at autostart.
+    pub(crate) fn enter_after_create(window: &Window, monitor: &MonitorHandle) {
+        move_to_screen(window, monitor);
+        set_fullscreen(window, true);
     }
 
     pub(crate) fn is_fullscreen(window: &Window) -> bool {
@@ -42,6 +44,56 @@ mod imp {
     // fullscreen leave them auto-hidden until quit. Fine for a show machine.
     pub(crate) fn set_fullscreen(window: &Window, fullscreen: bool) {
         window.set_simple_fullscreen(fullscreen);
+        // Without a Space of its own a fullscreen output is an ordinary window,
+        // so the control window could come up in front of it. Float it above
+        // normal windows while fullscreen; Esc / F11 hands the screen back.
+        window.set_window_level(if fullscreen {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        });
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSRect {
+        origin: NSPoint,
+        size: (f64, f64),
+    }
+
+    /// `[window setFrameOrigin:screen.frame.origin]` — winit's own move before
+    /// native fullscreen (`window_delegate.rs`, `set_fullscreen`).
+    fn move_to_screen(window: &Window, monitor: &MonitorHandle) {
+        use objc::runtime::Object;
+        use objc::{msg_send, sel, sel_impl};
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let Some(screen) = monitor.ns_screen() else {
+            log::warn!("Output monitor has no NSScreen; leaving the window where it opened");
+            return;
+        };
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return;
+        };
+        unsafe {
+            let view = appkit.ns_view.as_ptr() as *mut Object;
+            let ns_window: *mut Object = msg_send![view, window];
+            if ns_window.is_null() {
+                return;
+            }
+            let frame: NSRect = msg_send![screen as *mut Object, frame];
+            let _: () = msg_send![ns_window, setFrameOrigin: frame.origin];
+        }
     }
 }
 
@@ -54,7 +106,7 @@ mod imp {
         attrs.with_fullscreen(Some(Fullscreen::Borderless(Some(monitor.clone()))))
     }
 
-    pub(crate) fn enter_after_create(_window: &Window) {}
+    pub(crate) fn enter_after_create(_window: &Window, _monitor: &MonitorHandle) {}
 
     pub(crate) fn is_fullscreen(window: &Window) -> bool {
         window.fullscreen().is_some()
