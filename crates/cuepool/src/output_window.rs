@@ -260,6 +260,9 @@ impl App {
                     // Before the surface reads the size: fullscreen sets it.
                     if let Some(monitor) = on_monitor {
                         crate::output_fullscreen::enter_after_create(&window, monitor);
+                        // As the F11 / Cmd+F toggle does: no pointer on a
+                        // fullscreen output, including one opened at autostart.
+                        window.set_cursor_visible(false);
                     }
                     Arc::new(window)
                 }

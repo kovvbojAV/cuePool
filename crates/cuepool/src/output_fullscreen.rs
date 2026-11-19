@@ -10,7 +10,7 @@
 use winit::monitor::MonitorHandle;
 use winit::window::{Window, WindowAttributes};
 
-pub(crate) use imp::{enter_after_create, is_fullscreen, on_monitor, set_fullscreen};
+pub(crate) use imp::{enter_after_create, hide_cursor, is_fullscreen, on_monitor, set_fullscreen};
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -52,6 +52,34 @@ mod imp {
         } else {
             WindowLevel::Normal
         });
+    }
+
+    /// Hide the pointer app-wide while any output is fullscreen. winit hides
+    /// it with cursor rects, which AppKit honours only in the key window — at
+    /// autostart that is the control window behind the outputs, so the arrow
+    /// stayed on the projectors. Called every tick; acts only on a change, so
+    /// CoreGraphics' hide count stays balanced.
+    pub(crate) fn hide_cursor(hidden: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HIDDEN: AtomicBool = AtomicBool::new(false);
+        if HIDDEN.swap(hidden, Ordering::Relaxed) == hidden {
+            return;
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayHideCursor(display: u32) -> i32;
+            fn CGDisplayShowCursor(display: u32) -> i32;
+        }
+        // SAFETY: plain CoreGraphics calls on the main display id; balanced
+        // by the swap above.
+        unsafe {
+            if hidden {
+                CGDisplayHideCursor(CGMainDisplayID());
+            } else {
+                CGDisplayShowCursor(CGMainDisplayID());
+            }
+        }
     }
 
     #[repr(C)]
@@ -107,6 +135,9 @@ mod imp {
     }
 
     pub(crate) fn enter_after_create(_window: &Window, _monitor: &MonitorHandle) {}
+
+    /// Per-window cursor hiding works here; nothing app-wide to do.
+    pub(crate) fn hide_cursor(_hidden: bool) {}
 
     pub(crate) fn is_fullscreen(window: &Window) -> bool {
         window.fullscreen().is_some()

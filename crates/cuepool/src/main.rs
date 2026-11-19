@@ -4570,6 +4570,11 @@ impl ApplicationHandler<AppEvent> for App {
         // engine is out of reach and locking is unsafe — leave it a fresh answer
         // to read, and do its state write here. Raise the control window too: a
         // modal behind a minimised window reads as Cmd-Q doing nothing at all.
+        output_fullscreen::hide_cursor(
+            self.output_windows
+                .iter()
+                .any(|out| output_fullscreen::is_fullscreen(&out.window)),
+        );
         #[cfg(target_os = "macos")]
         {
             macos_quit::publish_needs_confirm(self.quit_needs_confirm());
