@@ -634,6 +634,14 @@ struct App {
     last_monitor_set: Vec<cuepool_core::MonitorId>,
     /// Throttle for the (OS-querying) monitor enumeration.
     last_monitor_check: std::time::Instant,
+    /// When to rebuild output windows after the monitor set last changed.
+    monitor_rebuild_due: Option<std::time::Instant>,
+    /// Consecutive seconds a fullscreen output went unpaced by vsync; negative
+    /// is the cool-down after a refit.
+    unpaced_secs: i32,
+    /// Outputs taken out of fullscreen by the unpaced-output refit, to re-enter
+    /// on the next diagnostics second.
+    refit_outputs: Vec<WindowId>,
     /// While Some and unexpired, each output window flashes a distinct colour so the
     /// operator can see which window is on which projector.
     identify_until: Option<std::time::Instant>,
@@ -1086,6 +1094,9 @@ impl App {
             occluded_close_warned: false,
             last_monitor_set: Vec::new(),
             last_monitor_check: std::time::Instant::now(),
+            monitor_rebuild_due: None,
+            unpaced_secs: 0,
+            refit_outputs: Vec::new(),
             identify_until: None,
             fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
             dbg_ticks: 0,
@@ -4880,9 +4891,20 @@ impl ApplicationHandler<AppEvent> for App {
                     s.available_monitors = current;
                 }
                 // Re-apply output→monitor assignment (a projector finished warming up
-                // after boot, or was power-cycled) so the wall self-heals.
+                // after boot, or was power-cycled) so the wall self-heals — once the
+                // set has settled. Rebuilding the moment a replugged screen appeared,
+                // while macOS was still reconfiguring it, left the new outputs unpaced
+                // by vsync (~1 fps on both walls) on the macOS 13 M1 Mac mini.
+                self.monitor_rebuild_due =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            }
+            if self
+                .monitor_rebuild_due
+                .is_some_and(|due| std::time::Instant::now() >= due)
+            {
+                self.monitor_rebuild_due = None;
                 if !self.output_windows.is_empty() {
-                    log::info!("Monitor set changed — rebuilding output windows");
+                    log::info!(target: PERSIST_TARGET, "Monitor set settled — rebuilding output windows");
                     self.create_output_windows(event_loop);
                 }
             }
@@ -5006,6 +5028,7 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                 })
                 .collect();
+            self.refit_unpaced_outputs(&outputs);
             let mut state = self.cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
             d.presented_per_sec = total_presented;
