@@ -9,15 +9,16 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ### Application features
 
-- *(cuepool)* time-window trigger ([#68](https://github.com/kovvbojAV/cuePool/pull/68))
-- *(cuepool)* open projects from Finder; reopen the last project on startup ([#70](https://github.com/kovvbojAV/cuePool/pull/70))
-- *(cuepool)* loop a group as one unit ([#69](https://github.com/kovvbojAV/cuePool/pull/69))
-- *(cuepool)* video layers with per-cue canvas regions ([#63](https://github.com/kovvbojAV/cuePool/pull/63))
-- *(cuepool)* GPU-native NotchLC playback ([#64](https://github.com/kovvbojAV/cuePool/pull/64))
+- Play videos side by side on one output: each video cue has a layer (1–4) and a canvas region, and videos on different layers play together, frame-synced, each started and stopped as its own cue ([#63](https://github.com/kovvbojAV/cuePool/pull/63)).
+- Loop a Group as one unit: its videos restart together when the longest ends, so clips of slightly different lengths stay in step ([#69](https://github.com/kovvbojAV/cuePool/pull/69)).
+- Time Window trigger: play a cue between two times each day. It starts if CuePool comes up inside the window, fades out at the end, and a Stop holds until the next window ([#68](https://github.com/kovvbojAV/cuePool/pull/68)).
+- Open a `.qproj` from Finder on macOS, and optionally reopen the last project on startup (Project Settings → This Computer). App settings are now saved as they change, not only on quit ([#70](https://github.com/kovvbojAV/cuePool/pull/70)).
+- Decode NotchLC video on the GPU. It is faster, and its colours are now correct ([#64](https://github.com/kovvbojAV/cuePool/pull/64)).
 
 ### Application fixes
 
-- *(cuepool)* reliable fullscreen outputs on macOS show machines ([#67](https://github.com/kovvbojAV/cuePool/pull/67))
+- macOS fullscreen outputs no longer crash CuePool when output windows are rebuilt. They stay on their own screens above other windows, hide the pointer, and re-enter fullscreen by themselves when the display stops pacing them ([#67](https://github.com/kovvbojAV/cuePool/pull/67)).
+- Drop video frames when the GPU falls behind instead of queuing uploads until memory runs out, and draw opaque side-by-side layers without a composite pass ([#63](https://github.com/kovvbojAV/cuePool/pull/63)).
 
 ## [0.13.5](https://github.com/kovvbojAV/cuePool/compare/v0.13.4...v0.13.5) - 2026-09-24
 
