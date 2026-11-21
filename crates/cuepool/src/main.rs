@@ -57,6 +57,7 @@ use ltc_source::{LtcReceiver, to_mtc_frame_rate};
 mod macos_quit;
 mod mtc_follow;
 use mtc_follow::MtcFollowState;
+mod output_fullscreen;
 mod output_window;
 use output_window::{
     OutputWindow, WindowIds, monitor_descriptor, pack_size, projection_structure_changed,
@@ -649,6 +650,14 @@ struct App {
     last_monitor_set: Vec<cuepool_core::MonitorId>,
     /// Throttle for the (OS-querying) monitor enumeration.
     last_monitor_check: std::time::Instant,
+    /// When to rebuild output windows after the monitor set last changed.
+    monitor_rebuild_due: Option<std::time::Instant>,
+    /// Consecutive seconds a fullscreen output went unpaced by vsync; negative
+    /// is the cool-down after a refit.
+    unpaced_secs: i32,
+    /// Outputs taken out of fullscreen by the unpaced-output refit, to re-enter
+    /// on the next diagnostics second.
+    refit_outputs: Vec<WindowId>,
     /// While Some and unexpired, each output window flashes a distinct colour so the
     /// operator can see which window is on which projector.
     identify_until: Option<std::time::Instant>,
@@ -1090,6 +1099,9 @@ impl App {
             occluded_close_warned: false,
             last_monitor_set: Vec::new(),
             last_monitor_check: std::time::Instant::now(),
+            monitor_rebuild_due: None,
+            unpaced_secs: 0,
+            refit_outputs: Vec::new(),
             identify_until: None,
             fps_debug: std::env::var("QPLAYER_FPS_DEBUG").is_ok(),
             dbg_ticks: 0,
@@ -4620,21 +4632,14 @@ impl ApplicationHandler<AppEvent> for App {
                         {
                             // Esc always exits fullscreen
                             if is_esc {
-                                out.window.set_fullscreen(None);
+                                output_fullscreen::set_fullscreen(&out.window, false);
                                 out.window.set_cursor_visible(true);
                             }
                             // F11, Ctrl+F, or Cmd+F toggles fullscreen
                             else if is_f11 || (is_f && has_ctrl) {
-                                let currently = out.window.fullscreen().is_some();
-                                if currently {
-                                    out.window.set_fullscreen(None);
-                                    out.window.set_cursor_visible(true);
-                                } else {
-                                    out.window.set_fullscreen(Some(
-                                        winit::window::Fullscreen::Borderless(None),
-                                    ));
-                                    out.window.set_cursor_visible(false);
-                                }
+                                let fullscreen = !output_fullscreen::is_fullscreen(&out.window);
+                                output_fullscreen::set_fullscreen(&out.window, fullscreen);
+                                out.window.set_cursor_visible(!fullscreen);
                             }
                         }
 
@@ -4709,6 +4714,11 @@ impl ApplicationHandler<AppEvent> for App {
         // engine is out of reach and locking is unsafe — leave it a fresh answer
         // to read, and do its state write here. Raise the control window too: a
         // modal behind a minimised window reads as Cmd-Q doing nothing at all.
+        output_fullscreen::hide_cursor(
+            self.output_windows
+                .iter()
+                .any(|out| output_fullscreen::is_fullscreen(&out.window)),
+        );
         #[cfg(target_os = "macos")]
         {
             macos_quit::publish_needs_confirm(self.quit_needs_confirm());
@@ -5014,9 +5024,20 @@ impl ApplicationHandler<AppEvent> for App {
                     s.available_monitors = current;
                 }
                 // Re-apply output→monitor assignment (a projector finished warming up
-                // after boot, or was power-cycled) so the wall self-heals.
+                // after boot, or was power-cycled) so the wall self-heals — once the
+                // set has settled. Rebuilding the moment a replugged screen appeared,
+                // while macOS was still reconfiguring it, left the new outputs unpaced
+                // by vsync (~1 fps on both walls) on the macOS 13 M1 Mac mini.
+                self.monitor_rebuild_due =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            }
+            if self
+                .monitor_rebuild_due
+                .is_some_and(|due| std::time::Instant::now() >= due)
+            {
+                self.monitor_rebuild_due = None;
                 if !self.output_windows.is_empty() {
-                    log::info!("Monitor set changed — rebuilding output windows");
+                    log::info!(target: PERSIST_TARGET, "Monitor set settled — rebuilding output windows");
                     self.create_output_windows(event_loop);
                 }
             }
@@ -5163,11 +5184,12 @@ impl ApplicationHandler<AppEvent> for App {
                             .and_then(|m| m.refresh_rate_millihertz())
                             .map(|mhz| format!("{:.2} Hz", mhz as f64 / 1000.0))
                             .unwrap_or_else(|| "?".into()),
-                        fullscreen: out.window.fullscreen().is_some(),
+                        fullscreen: output_fullscreen::is_fullscreen(&out.window),
                         presented_per_sec,
                     }
                 })
                 .collect();
+            self.refit_unpaced_outputs(&outputs);
             let mut state = self.cuepool.state().lock_unpoisoned();
             let d = &mut state.diagnostics;
             d.presented_per_sec = total_presented;
