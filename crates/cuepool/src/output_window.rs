@@ -140,6 +140,15 @@ fn output_failure_summary(total: usize, active: usize, failures: &[String]) -> S
     }
 }
 
+const UNPACED_REFIT_AFTER_SECS: i32 = 3;
+const UNPACED_REFIT_COOLDOWN_SECS: i32 = 60;
+
+/// Unpaced seconds counted toward a refit; a negative count is the cool-down
+/// after one, which keeps running while outputs are paced.
+fn next_unpaced_secs(secs: i32, unpaced: bool) -> i32 {
+    if unpaced || secs < 0 { secs + 1 } else { 0 }
+}
+
 fn surface_size_is_valid(width: u32, height: u32) -> bool {
     width > 0 && height > 0
 }
@@ -151,17 +160,59 @@ fn output_runtime_role(configured_index: usize, active_outputs: usize) -> (usize
 impl App {
     /// Toggle fullscreen on all output windows and update cursor visibility.
     pub(crate) fn toggle_output_fullscreen(&self) {
+        // Reverse creation order: on macOS each window restores the menu-bar
+        // options it saw on entry, so the first one in must be the last out.
+        for out in self.output_windows.iter().rev() {
+            let fullscreen = !crate::output_fullscreen::is_fullscreen(&out.window);
+            crate::output_fullscreen::set_fullscreen(&out.window, fullscreen);
+            out.window.set_cursor_visible(!fullscreen);
+        }
+    }
+
+    /// Self-heal for fullscreen outputs that macOS stops pacing to vsync: presents
+    /// burst to hundreds a second, then stall ~1 s waiting for a drawable, and both
+    /// walls drop to ~1 fps. Every second of the stall has an output under 20
+    /// presents, so that alone detects it (an upper bound would trip on 240 Hz). Seen on the macOS 13 M1 Mac mini when outputs were
+    /// built while the displays were still settling (login, HDMI replug). Leaving
+    /// and re-entering fullscreen (Esc, then Cmd+F) restores pacing, so do that.
+    /// Called once per diagnostics second; `diags` is in `output_windows` order.
+    pub(crate) fn refit_unpaced_outputs(&mut self, diags: &[cuepool_gui::OutputDiagnostics]) {
         for out in &self.output_windows {
-            let currently_fullscreen = out.window.fullscreen().is_some();
-            if currently_fullscreen {
-                out.window.set_fullscreen(None);
-                out.window.set_cursor_visible(true);
-            } else {
-                out.window
-                    .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            if self.refit_outputs.contains(&out.id) {
+                crate::output_fullscreen::set_fullscreen(&out.window, true);
                 out.window.set_cursor_visible(false);
             }
         }
+        self.refit_outputs.clear();
+
+        let unpaced: Vec<WindowId> = self
+            .output_windows
+            .iter()
+            .zip(diags)
+            .filter(|(_, d)| d.fullscreen && d.presented_per_sec < 20.0)
+            .map(|(out, _)| out.id)
+            .collect();
+        self.unpaced_secs = next_unpaced_secs(self.unpaced_secs, !unpaced.is_empty());
+        if self.unpaced_secs < UNPACED_REFIT_AFTER_SECS {
+            return;
+        }
+        self.unpaced_secs = -UNPACED_REFIT_COOLDOWN_SECS;
+        let rates: Vec<String> = diags
+            .iter()
+            .map(|d| format!("'{}' {:.0}/s", d.name, d.presented_per_sec))
+            .collect();
+        log::warn!(
+            target: cuepool_gui::logging::PERSIST_TARGET,
+            "Fullscreen outputs not paced by vsync ({}); re-entering fullscreen",
+            rates.join(", ")
+        );
+        // Reverse creation order, as in toggle_output_fullscreen.
+        for out in self.output_windows.iter().rev() {
+            if unpaced.contains(&out.id) {
+                crate::output_fullscreen::set_fullscreen(&out.window, false);
+            }
+        }
+        self.refit_outputs = unpaced;
     }
 
     /// Create (or recreate) the video output window (starts windowed).
@@ -246,12 +297,9 @@ impl App {
                 .with_title(format!("CuePool Output {}", output.name))
                 .with_visible(true);
 
-            if let Some(mon_idx) = assigned[out_idx] {
-                if let Some(monitor) = monitors.get(mon_idx) {
-                    attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(
-                        Some(monitor.clone()),
-                    )));
-                }
+            let on_monitor = assigned[out_idx].and_then(|idx| monitors.get(idx));
+            if let Some(monitor) = on_monitor {
+                attrs = crate::output_fullscreen::on_monitor(attrs, monitor);
             } else {
                 let aspect = output.output_height.max(1) as f64 / output.output_width.max(1) as f64;
                 let h = (tile_w * aspect).min(screen_h * 0.7);
@@ -263,7 +311,16 @@ impl App {
             }
 
             let window = match event_loop.create_window(attrs) {
-                Ok(window) => Arc::new(window),
+                Ok(window) => {
+                    // Before the surface reads the size: fullscreen sets it.
+                    if let Some(monitor) = on_monitor {
+                        crate::output_fullscreen::enter_after_create(&window, monitor);
+                        // As the F11 / Cmd+F toggle does: no pointer on a
+                        // fullscreen output, including one opened at autostart.
+                        window.set_cursor_visible(false);
+                    }
+                    Arc::new(window)
+                }
                 Err(error) => {
                     record_output_failure(
                         &mut failed_outputs,
@@ -371,7 +428,7 @@ impl App {
                     config.present_mode,
                     config.format,
                     refresh,
-                    window.fullscreen().is_some(),
+                    crate::output_fullscreen::is_fullscreen(&window),
                 );
             }
 
@@ -505,7 +562,25 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{output_failure_summary, output_runtime_role, surface_size_is_valid};
+    use super::{
+        UNPACED_REFIT_AFTER_SECS, UNPACED_REFIT_COOLDOWN_SECS, next_unpaced_secs,
+        output_failure_summary, output_runtime_role, surface_size_is_valid,
+    };
+
+    #[test]
+    fn unpaced_refit_needs_consecutive_seconds_and_cools_down() {
+        let after = |seconds: &[bool], start: i32| {
+            seconds
+                .iter()
+                .fold(start, |secs, &unpaced| next_unpaced_secs(secs, unpaced))
+        };
+        assert_eq!(after(&[true, true], 0), 2);
+        assert_eq!(after(&[true, true, false, true], 0), 1);
+        assert_eq!(after(&[true; 3], 0), UNPACED_REFIT_AFTER_SECS);
+        // A paced second doesn't cut the cool-down short.
+        let cooled = after(&[false; 10], -UNPACED_REFIT_COOLDOWN_SECS);
+        assert_eq!(cooled, -UNPACED_REFIT_COOLDOWN_SECS + 10);
+    }
 
     #[test]
     fn output_failure_summary_distinguishes_partial_and_total_failure() {

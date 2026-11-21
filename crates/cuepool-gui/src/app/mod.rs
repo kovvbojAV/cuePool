@@ -504,6 +504,9 @@ pub struct SharedState {
     pub recent_files: Vec<PathBuf>,
     /// Release-notes series acknowledged by the operator, persisted by the binary.
     pub last_seen_release_notes: Option<String>,
+    /// App setting (this machine, not the show file): reopen the most recent
+    /// project at startup. Persisted by the binary.
+    pub open_last_project: bool,
     /// Whether the project settings window is open.
     pub show_settings_window: bool,
     /// Current audio output device name.
@@ -683,6 +686,7 @@ impl Default for SharedState {
             meter_data: GuiMeterData::default(),
             recent_files: Vec::new(),
             last_seen_release_notes: None,
+            open_last_project: false,
             show_settings_window: false,
             audio_device_name: String::new(),
             audio_error: None,
@@ -1599,6 +1603,14 @@ impl CuePoolApp {
                         let ltc_inputs = state.ltc_input_devices.clone();
                         let ltc_outputs = state.ltc_output_devices.clone();
                         let audio_error = state.audio_error.clone();
+                        egui::CollapsingHeader::new("This Computer").default_open(true).show(ui, |ui| {
+                            ui.checkbox(&mut state.open_last_project, "Open last project on startup")
+                                .on_hover_text(
+                                    "When CuePool starts without a project, reopen the most recent \
+                                     one. Saved on this machine, not in the show file.",
+                                );
+                        });
+                        ui.separator();
                         let settings = &mut state.show_file.show_settings;
 
                         egui::CollapsingHeader::new("Show Info").default_open(true).show(ui, |ui| {
@@ -3141,6 +3153,8 @@ impl CuePoolApp {
                                 routing: cuepool_core::AudioRouting::default(),
                                 follow_mtc: false,
                                 mtc_start: cuepool_core::Timespan::from_secs_f64(3600.0),
+                                layer: cuepool_core::cue::default_video_layer(),
+                                region: None,
                             },
                             CueType::Stop => cuepool_core::Cue::Stop {
                                 base,

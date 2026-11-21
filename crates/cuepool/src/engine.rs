@@ -1,6 +1,7 @@
 use cuepool_audio::{AudioEngine, CueChainParams, FileDecoder, SampleProvider};
 use cuepool_core::{
-    Cue, CueBase, LockExt, LoopMode, ShowFile, ShowSettings, StopMode, Timespan, TriggerMode,
+    CanvasRect, Cue, CueBase, LockExt, LoopMode, MAX_VIDEO_LAYERS, ShowFile, ShowSettings,
+    StopMode, Timespan, TriggerMode,
 };
 use cuepool_gui::SharedStateHandle;
 use cuepool_gui::app::CueState;
@@ -67,16 +68,23 @@ pub enum EngineAction {
         duration: Timespan,
         follow_mtc: bool,
         mtc_start: Timespan,
+        /// 1..=MAX_VIDEO_LAYERS; replaces whatever plays on this layer.
+        layer: u8,
+        /// Canvas placement; `None` = the whole canvas.
+        region: Option<CanvasRect>,
     },
     SeekVideo {
         qid: Decimal,
         instance_id: u64,
+        layer: u8,
         path: String,
         target_secs: f64,
         media_offset_secs: f64,
         paused: bool,
     },
     StopVideo {
+        /// `None` = every layer.
+        layer: Option<u8>,
         fade_out_secs: f32,
     },
     SetVideoPaused(bool),
@@ -110,6 +118,7 @@ pub struct VideoSnapshot {
     pub qid: Decimal,
     pub instance_id: u64,
     pub epoch: u64,
+    pub layer: u8,
     pub path: String,
     pub paused: bool,
     pub position_secs: f64,
@@ -121,7 +130,8 @@ pub struct EngineSnapshot {
     pub paused: bool,
     pub show_elapsed_secs: Option<f64>,
     pub active_cues: Vec<ActiveCueSnapshot>,
-    pub video: Option<VideoSnapshot>,
+    /// Playing videos, in layer order.
+    pub videos: Vec<VideoSnapshot>,
 }
 
 #[derive(Clone)]
@@ -172,9 +182,56 @@ struct CurrentVideo {
     has_audio: bool,
     clock_origin: Duration,
     paused_position: Option<f64>,
+    layer: u8,
+    region: Option<CanvasRect>,
+    /// A HoldLast picture reached its end and is holding its last frame.
+    held: bool,
+}
+
+/// A looping Group: its members play once each pass; when every one has
+/// finished, all restart in one tick so they share a first frame.
+struct GroupLoop {
+    group: Decimal,
+    /// The members as fired each pass (videos hold their last frame, so a
+    /// shorter clip waits for the longest one).
+    members: Vec<Cue>,
+    /// Restarts left; None loops forever.
+    restarts_left: Option<u32>,
+}
+
+/// Only sound and video take time; a loop of instant cues would refire every
+/// tick.
+fn has_timed_member(members: &[Cue]) -> bool {
+    members
+        .iter()
+        .any(|member| matches!(member, Cue::Sound { .. } | Cue::Video { .. }))
+}
+
+/// A group member as one pass of a group loop plays it: the group does the
+/// looping, so the member plays once, and a video holds its last frame until
+/// the restart.
+fn member_for_group_pass(mut cue: Cue) -> Cue {
+    cue.base_mut().loop_mode = if matches!(cue, Cue::Video { .. }) {
+        LoopMode::HoldLast
+    } else {
+        LoopMode::OneShot
+    };
+    cue
 }
 
 impl CurrentVideo {
+    fn position(&self, now: Duration) -> f64 {
+        let position = self
+            .paused_position
+            .unwrap_or_else(|| now.saturating_sub(self.clock_origin).as_secs_f64());
+        let duration = self.duration.as_secs_f64();
+        if duration > 0.0 {
+            position.min(duration)
+        } else {
+            position
+        }
+    }
+
     /// True when the picture reaches an end of its own accord, so an AfterLast
     /// follow must wait for it as well as for the audio track.
     ///
@@ -201,12 +258,14 @@ pub struct ShowEngine {
     show_adjustment_secs: f64,
     triggered_timecodes: HashSet<Decimal>,
     active_timecodes: Vec<(Decimal, Duration)>,
-    current_video: Option<CurrentVideo>,
+    /// One entry per busy video layer, kept in layer order.
+    videos: Vec<CurrentVideo>,
     /// A one-shot video cue with an audio track ends when BOTH streams do:
     /// picture and audio lengths routinely differ inside one container. The
     /// half that finishes first is recorded here as (qid, instance_id); the
     /// second one fires the AfterLast follow.
-    pending_video_half: Option<(Decimal, u64)>,
+    pending_video_halves: Vec<(Decimal, u64)>,
+    group_loops: Vec<GroupLoop>,
     current_picture_qid: Option<Decimal>,
     actions: VecDeque<EngineAction>,
 }
@@ -237,8 +296,9 @@ impl ShowEngine {
             show_adjustment_secs: 0.0,
             triggered_timecodes: HashSet::new(),
             active_timecodes: Vec::new(),
-            current_video: None,
-            pending_video_half: None,
+            videos: Vec::new(),
+            pending_video_halves: Vec::new(),
+            group_loops: Vec::new(),
             current_picture_qid: None,
             actions: VecDeque::new(),
         }
@@ -299,6 +359,7 @@ impl ShowEngine {
         self.check_pending_stops();
         self.check_finished_cues();
         self.check_video_loops();
+        self.check_group_loops();
         self.check_delayed_cues();
         self.check_timecodes();
         if let Some(engine) = &self.audio_engine {
@@ -344,14 +405,19 @@ impl ShowEngine {
             paused: self.paused,
             show_elapsed_secs: self.show_elapsed().map(|time| time.as_secs_f64()),
             active_cues,
-            video: self.current_video.as_ref().map(|video| VideoSnapshot {
-                qid: video.qid,
-                instance_id: video.instance_id,
-                epoch: video.epoch,
-                path: video.path.clone(),
-                paused: self.paused,
-                position_secs: self.video_position(video),
-            }),
+            videos: self
+                .videos
+                .iter()
+                .map(|video| VideoSnapshot {
+                    qid: video.qid,
+                    instance_id: video.instance_id,
+                    epoch: video.epoch,
+                    layer: video.layer,
+                    path: video.path.clone(),
+                    paused: self.paused,
+                    position_secs: video.position(self.now),
+                })
+                .collect(),
         }
     }
 
@@ -366,8 +432,8 @@ impl ShowEngine {
         self.paused
     }
 
-    pub fn current_video_qid(&self) -> Option<Decimal> {
-        self.current_video.as_ref().map(|video| video.qid)
+    pub fn is_video_playing(&self, qid: Decimal) -> bool {
+        self.videos.iter().any(|video| video.qid == qid)
     }
 
     pub fn adjust_show_time(&mut self, delta_secs: f64) {
@@ -602,6 +668,8 @@ impl ShowEngine {
                 routing,
                 follow_mtc,
                 mtc_start,
+                layer,
+                region,
                 ..
             } => {
                 self.current_picture_qid = None;
@@ -633,7 +701,7 @@ impl ShowEngine {
                     .map(|active| active.instance_id);
                 let instance_id = audio_instance.unwrap_or(fallback_instance);
                 let resolved = self.resolve_path(path).unwrap_or_else(|| path.clone());
-                self.current_video = Some(CurrentVideo {
+                self.push_video_action(CurrentVideo {
                     qid,
                     instance_id,
                     epoch: 0,
@@ -646,12 +714,10 @@ impl ShowEngine {
                     has_audio: audio_instance.is_some(),
                     clock_origin: self.now,
                     paused_position: self.paused.then_some(0.0),
+                    layer: (*layer).clamp(1, MAX_VIDEO_LAYERS),
+                    region: *region,
+                    held: false,
                 });
-                let video = self
-                    .current_video
-                    .clone()
-                    .expect("video was just installed");
-                self.push_video_action(video);
                 if audio_instance.is_none() {
                     self.trace(EngineTrace::CueStarted {
                         qid,
@@ -706,6 +772,29 @@ impl ShowEngine {
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let base = cue.base();
+                let members =
+                    if matches!(base.loop_mode, LoopMode::Looped | LoopMode::LoopedInfinite)
+                        && has_timed_member(&members)
+                    {
+                        let members = members
+                            .into_iter()
+                            .map(member_for_group_pass)
+                            .collect::<Vec<_>>();
+                        self.group_loops.retain(|playing| playing.group != qid);
+                        self.group_loops.push(GroupLoop {
+                            group: qid,
+                            members: members.clone(),
+                            restarts_left: match base.loop_mode {
+                                LoopMode::LoopedInfinite => None,
+                                // Loop Count is the total number of passes.
+                                _ => Some(u32::try_from(base.loop_count.max(1) - 1).unwrap_or(0)),
+                            },
+                        });
+                        members
+                    } else {
+                        members
+                    };
                 for member in members {
                     self.play_cue(member);
                 }
@@ -736,7 +825,8 @@ impl ShowEngine {
             }
             _ => {
                 if matches!(cue, Cue::Image { .. }) {
-                    self.current_video = None;
+                    // A still takes the whole canvas: every video layer goes.
+                    self.videos.clear();
                     self.current_picture_qid = Some(qid);
                 }
                 self.trace(EngineTrace::CueStarted {
@@ -948,9 +1038,7 @@ impl ShowEngine {
     }
 
     fn cue_is_active(&self, qid: Decimal) -> bool {
-        self.current_video
-            .as_ref()
-            .is_some_and(|video| video.qid == qid)
+        self.is_video_playing(qid)
             || self.current_picture_qid == Some(qid)
             || self.active_cues.iter().any(|cue| {
                 cue.qid == qid
@@ -1104,16 +1192,31 @@ impl ShowEngine {
                 .retain(|delayed| delayed.cue.base().qid != qid);
             self.active_timecodes.retain(|(tc_qid, _)| *tc_qid != qid);
         }
-        if self
-            .current_video
-            .as_ref()
-            .is_some_and(|video| video.qid == qid)
-            && mode != StopMode::LoopEnd
-        {
-            self.actions
-                .push_back(EngineAction::StopVideo { fade_out_secs });
-            self.current_video = None;
-            self.pending_video_half = None;
+        if mode == StopMode::LoopEnd {
+            // Finish the current pass, then stop.
+            for group_loop in self.group_loops.iter_mut().filter(|g| g.group == qid) {
+                group_loop.restarts_left = Some(0);
+            }
+        } else {
+            self.group_loops
+                .retain(|group_loop| group_loop.group != qid);
+            self.leave_group_loops(qid);
+        }
+        if mode != StopMode::LoopEnd {
+            for layer in self
+                .videos
+                .iter()
+                .filter(|video| video.qid == qid)
+                .map(|video| video.layer)
+                .collect::<Vec<_>>()
+            {
+                self.actions.push_back(EngineAction::StopVideo {
+                    layer: Some(layer),
+                    fade_out_secs,
+                });
+            }
+            self.videos.retain(|video| video.qid != qid);
+            self.pending_video_halves.retain(|(half, _)| *half != qid);
         }
         if self.current_picture_qid == Some(qid) && mode != StopMode::LoopEnd {
             self.current_picture_qid = None;
@@ -1154,16 +1257,18 @@ impl ShowEngine {
         // Only a video can ride the canvas fade; a still picture has no fade
         // machinery, so anything else blanks instantly, as the instant stop
         // does.
-        let video_fade = if self.current_video.is_some() {
-            fade_out_secs
-        } else {
+        let video_fade = if self.videos.is_empty() {
             0.0
+        } else {
+            fade_out_secs
         };
-        self.current_video = None;
-        self.pending_video_half = None;
+        self.videos.clear();
+        self.pending_video_halves.clear();
+        self.group_loops.clear();
         self.current_picture_qid = None;
         self.actions.push_back(EngineAction::StopAllExternal);
         self.actions.push_back(EngineAction::StopVideo {
+            layer: None,
             fade_out_secs: video_fade,
         });
         self.reset_show_clock();
@@ -1176,14 +1281,17 @@ impl ShowEngine {
         self.active_cues.clear();
         self.delayed_cues.clear();
         self.active_timecodes.clear();
-        self.current_video = None;
-        self.pending_video_half = None;
+        self.videos.clear();
+        self.pending_video_halves.clear();
+        self.group_loops.clear();
         self.current_picture_qid = None;
         self.paused = false;
         self.reset_show_clock();
         self.actions.push_back(EngineAction::StopAllExternal);
-        self.actions
-            .push_back(EngineAction::StopVideo { fade_out_secs: 0.0 });
+        self.actions.push_back(EngineAction::StopVideo {
+            layer: None,
+            fade_out_secs: 0.0,
+        });
         self.actions.push_back(EngineAction::SetVideoPaused(false));
     }
 
@@ -1194,12 +1302,8 @@ impl ShowEngine {
                 cue.state = CueState::Paused;
             }
         }
-        let video_position = self
-            .current_video
-            .as_ref()
-            .map(|video| self.video_position(video));
-        if let (Some(video), Some(position)) = (&mut self.current_video, video_position) {
-            video.paused_position = Some(position);
+        for video in &mut self.videos {
+            video.paused_position = Some(video.position(self.now));
         }
         self.paused = true;
         self.show_pause_started.get_or_insert(self.now);
@@ -1217,10 +1321,10 @@ impl ShowEngine {
                 };
             }
         }
-        if let Some(video) = &mut self.current_video
-            && let Some(position) = video.paused_position.take()
-        {
-            video.clock_origin = self.now.saturating_sub(Duration::from_secs_f64(position));
+        for video in &mut self.videos {
+            if let Some(position) = video.paused_position.take() {
+                video.clock_origin = self.now.saturating_sub(Duration::from_secs_f64(position));
+            }
         }
         self.paused = false;
         if let Some(paused_at) = self.show_pause_started.take() {
@@ -1236,9 +1340,9 @@ impl ShowEngine {
             .find(|cue| cue.instance_id == instance_id)
             .map(|cue| cue.qid)
             .or_else(|| {
-                self.current_video
-                    .as_ref()
-                    .filter(|video| video.instance_id == instance_id)
+                self.videos
+                    .iter()
+                    .find(|video| video.instance_id == instance_id)
                     .map(|video| video.qid)
             });
         let Some(qid) = qid else { return };
@@ -1259,10 +1363,9 @@ impl ShowEngine {
         } = cue
         {
             let Some(video) = self
-                .current_video
-                .as_ref()
-                .filter(|video| video.instance_id == instance_id)
-                .cloned()
+                .videos
+                .iter_mut()
+                .find(|video| video.instance_id == instance_id)
             else {
                 return;
             };
@@ -1271,17 +1374,17 @@ impl ShowEngine {
                 audio_target.unwrap_or_else(|| sanitize_seek(secs)),
                 configured_length,
             );
-            if let Some(current) = self.current_video.as_mut() {
-                if self.paused {
-                    current.paused_position = Some(target);
-                } else {
-                    current.clock_origin = self.now.saturating_sub(Duration::from_secs_f64(target));
-                }
+            if self.paused {
+                video.paused_position = Some(target);
+            } else {
+                video.clock_origin = self.now.saturating_sub(Duration::from_secs_f64(target));
             }
+            let (layer, path) = (video.layer, video.path.clone());
             self.actions.push_back(EngineAction::SeekVideo {
                 qid,
                 instance_id,
-                path: video.path,
+                layer,
+                path,
                 target_secs: target,
                 media_offset_secs: start_time.as_secs_f64(),
                 paused: self.paused,
@@ -1434,27 +1537,34 @@ impl ShowEngine {
     /// cue whose picture ends on its own — either still playing, or already
     /// ended and waiting on this half.
     fn audio_half_of_pending_video(&self, qid: Decimal, instance_id: u64) -> bool {
-        self.current_video.as_ref().is_some_and(|video| {
+        self.videos.iter().any(|video| {
             video.instance_id == instance_id && video.has_audio && video.picture_ends_on_its_own()
-        }) || self.pending_video_half == Some((qid, instance_id))
+        }) || self.pending_video_halves.contains(&(qid, instance_id))
     }
 
     /// Record one half (picture or audio) of a video cue finishing. Returns
     /// true once both halves are in, i.e. when the follow should fire.
     fn record_video_half(&mut self, qid: Decimal, instance_id: u64) -> bool {
-        if self.pending_video_half == Some((qid, instance_id)) {
-            self.pending_video_half = None;
+        if let Some(index) = self
+            .pending_video_halves
+            .iter()
+            .position(|half| *half == (qid, instance_id))
+        {
+            self.pending_video_halves.swap_remove(index);
             true
         } else {
-            self.pending_video_half = Some((qid, instance_id));
+            self.pending_video_halves.push((qid, instance_id));
             false
         }
     }
 
     fn check_video_loops(&mut self) {
-        let Some(video) = self.current_video.clone() else {
-            return;
-        };
+        for video in self.videos.clone() {
+            self.check_video_loop(video);
+        }
+    }
+
+    fn check_video_loop(&mut self, video: CurrentVideo) {
         if video.follow_mtc {
             return;
         }
@@ -1483,6 +1593,81 @@ impl ShowEngine {
         if looped {
             self.push_video_action(video);
         }
+    }
+
+    /// Restart every looping group whose members have all finished this pass.
+    fn check_group_loops(&mut self) {
+        let mut index = 0;
+        while index < self.group_loops.len() {
+            let finished = self.group_loops[index]
+                .members
+                .iter()
+                .all(|member| self.group_member_finished(member.base().qid));
+            if !finished {
+                index += 1;
+                continue;
+            }
+            let group_loop = &mut self.group_loops[index];
+            match group_loop.restarts_left.as_mut() {
+                Some(0) => {
+                    let group_loop = self.group_loops.remove(index);
+                    for member in &group_loop.members {
+                        self.stop_single(
+                            member.base().qid,
+                            StopMode::Immediate,
+                            0.0,
+                            Default::default(),
+                        );
+                    }
+                    // ponytail: no AfterLast follow — groups have never had
+                    // one, and the next cue after a group needs its own rules.
+                    self.trace(EngineTrace::CueFinished {
+                        qid: group_loop.group,
+                    });
+                }
+                left => {
+                    if let Some(left) = left {
+                        *left -= 1;
+                    }
+                    let members = group_loop.members.clone();
+                    // Held pictures stay up until each restarted stream's first
+                    // frame replaces them, so they are dropped without a stop.
+                    self.videos
+                        .retain(|video| !members.iter().any(|m| m.base().qid == video.qid));
+                    // One tick, one clock origin: every member restarts on the
+                    // same first frame.
+                    for member in members {
+                        self.play_cue(member);
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    /// A member has finished its pass: no audio still playing, no start
+    /// pending on a delay, and any picture is holding its last frame.
+    fn group_member_finished(&self, qid: Decimal) -> bool {
+        !self.active_cues.iter().any(|cue| cue.qid == qid)
+            && !self
+                .delayed_cues
+                .iter()
+                .any(|delayed| delayed.cue.base().qid == qid)
+            && self
+                .videos
+                .iter()
+                .filter(|video| video.qid == qid)
+                .all(|video| video.held)
+    }
+
+    /// Take a cue out of every group loop (stopped or unreadable); a loop
+    /// left with nothing that takes time ends.
+    fn leave_group_loops(&mut self, qid: Decimal) {
+        for group_loop in &mut self.group_loops {
+            group_loop.members.retain(|member| member.base().qid != qid);
+        }
+        self.group_loops
+            .retain(|group_loop| has_timed_member(&group_loop.members));
     }
 
     fn check_delayed_cues(&mut self) {
@@ -1535,13 +1720,24 @@ impl ShowEngine {
         }
     }
 
-    fn video_eof(&mut self, instance_id: u64, epoch: u64) {
-        let Some(video) = self
-            .current_video
-            .as_ref()
-            .filter(|video| video.instance_id == instance_id && video.epoch == epoch)
+    /// The video with this runtime identity, still current on its layer.
+    fn current_video(&self, instance_id: u64, epoch: u64) -> Option<CurrentVideo> {
+        self.videos
+            .iter()
+            .find(|video| video.instance_id == instance_id && video.epoch == epoch)
             .cloned()
-        else {
+    }
+
+    fn remove_video(&mut self, video: &CurrentVideo) {
+        self.videos.retain(|playing| playing.layer != video.layer);
+        self.actions.push_back(EngineAction::StopVideo {
+            layer: Some(video.layer),
+            fade_out_secs: 0.0,
+        });
+    }
+
+    fn video_eof(&mut self, instance_id: u64, epoch: u64) {
+        let Some(video) = self.current_video(instance_id, epoch) else {
             return;
         };
         if video.follow_mtc {
@@ -1552,11 +1748,17 @@ impl ShowEngine {
             LoopMode::Looped | LoopMode::LoopedInfinite => {
                 self.push_video_action(video);
             }
-            LoopMode::HoldLast => {}
+            LoopMode::HoldLast => {
+                if let Some(held) = self
+                    .videos
+                    .iter_mut()
+                    .find(|playing| playing.instance_id == instance_id && playing.epoch == epoch)
+                {
+                    held.held = true;
+                }
+            }
             _ => {
-                self.current_video = None;
-                self.actions
-                    .push_back(EngineAction::StopVideo { fade_out_secs: 0.0 });
+                self.remove_video(&video);
                 // With an audio track the follow waits for whichever stream
                 // ends last; without one the picture is the whole cue.
                 let follow_now = if video.has_audio {
@@ -1573,17 +1775,12 @@ impl ShowEngine {
     }
 
     fn video_failed(&mut self, instance_id: u64, epoch: u64) {
-        let Some(video) = self
-            .current_video
-            .as_ref()
-            .filter(|video| video.instance_id == instance_id && video.epoch == epoch)
-            .cloned()
-        else {
+        let Some(video) = self.current_video(instance_id, epoch) else {
             return;
         };
-        self.current_video = None;
-        self.actions
-            .push_back(EngineAction::StopVideo { fade_out_secs: 0.0 });
+        self.remove_video(&video);
+        // A clip that cannot be read must not be restarted every pass.
+        self.leave_group_loops(video.qid);
         if !video.has_audio {
             self.trace(EngineTrace::CueFinished { qid: video.qid });
         }
@@ -1603,7 +1800,13 @@ impl ShowEngine {
         video.epoch = video.epoch.wrapping_add(1).max(1);
         video.clock_origin = self.now;
         video.paused_position = self.paused.then_some(0.0);
-        self.current_video = Some(video.clone());
+        video.held = false;
+        // Replaces whatever plays on this layer (a loop restart replaces itself).
+        self.videos.retain(|playing| playing.layer != video.layer);
+        let at = self
+            .videos
+            .partition_point(|playing| playing.layer < video.layer);
+        self.videos.insert(at, video.clone());
         self.actions.push_back(EngineAction::PlayVideo {
             qid: video.qid,
             instance_id: video.instance_id,
@@ -1614,6 +1817,8 @@ impl ShowEngine {
             duration: video.duration,
             follow_mtc: video.follow_mtc,
             mtc_start: video.mtc_start,
+            layer: video.layer,
+            region: video.region,
         });
     }
 
@@ -1648,18 +1853,6 @@ impl ShowEngine {
             .as_ref()
             .map(AudioEngine::sample_rate)
             .unwrap_or(48_000)
-    }
-
-    fn video_position(&self, video: &CurrentVideo) -> f64 {
-        let position = video
-            .paused_position
-            .unwrap_or_else(|| self.now.saturating_sub(video.clock_origin).as_secs_f64());
-        let duration = video.duration.as_secs_f64();
-        if duration > 0.0 {
-            position.min(duration)
-        } else {
-            position
-        }
     }
 
     fn resolve_path(&self, path: &str) -> Option<String> {
@@ -1921,7 +2114,7 @@ mod tests {
             pending_stop: None,
             follow_after_last: true,
         });
-        engine.current_video = Some(CurrentVideo {
+        engine.videos = vec![CurrentVideo {
             qid: Decimal::ONE,
             instance_id: 1,
             epoch: 1,
@@ -1934,7 +2127,10 @@ mod tests {
             has_audio: true,
             clock_origin: Duration::ZERO,
             paused_position: None,
-        });
+            layer: 1,
+            region: None,
+            held: false,
+        }];
         (engine, position, loop_counter)
     }
 
@@ -1984,7 +2180,7 @@ mod tests {
         let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
         let clock_origin = Duration::from_secs(12);
         engine.now = clock_origin;
-        engine.push_video_action(engine.current_video.clone().unwrap());
+        engine.push_video_action(engine.videos[0].clone());
 
         assert!(matches!(
             engine.take_actions().as_slice(),
@@ -2458,6 +2654,8 @@ mod tests {
                     routing: Default::default(),
                     follow_mtc: false,
                     mtc_start: Timespan::ZERO,
+                    layer: 1,
+                    region: None,
                 },
                 Cue::Image {
                     base: cuepool_core::CueBase {
@@ -2472,9 +2670,9 @@ mod tests {
         }
         let mut engine = ShowEngine::new(app.state().clone(), None);
         engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
-        assert!(engine.snapshot().video.is_some());
+        assert!(!engine.snapshot().videos.is_empty());
         engine.command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO);
-        assert!(engine.snapshot().video.is_none());
+        assert!(engine.snapshot().videos.is_empty());
         assert!(
             engine
                 .command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO)
@@ -2513,17 +2711,17 @@ mod tests {
     fn audio_backed_loop_holds_video_at_eof_until_audio_boundary() {
         let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
         engine.video_eof(1, 1);
-        assert!(engine.current_video.is_some());
+        assert!(!engine.videos.is_empty());
         assert!(engine.take_actions().is_empty());
 
         let (mut video_only, _, _) = looped_video_engine(LoopMode::Looped);
-        video_only.current_video.as_mut().unwrap().has_audio = false;
+        video_only.videos[0].has_audio = false;
         video_only.video_eof(1, 1);
         assert_eq!(play_video_count(&video_only.take_actions()), 1);
 
         let (mut one_shot, _, _) = looped_video_engine(LoopMode::OneShot);
         one_shot.video_eof(1, 1);
-        assert!(one_shot.current_video.is_none());
+        assert!(one_shot.videos.is_empty());
         assert!(matches!(
             one_shot.take_actions().as_slice(),
             [EngineAction::StopVideo { .. }]
@@ -2577,18 +2775,18 @@ mod tests {
             followed(&mut engine),
             "looped follow waited for a picture end"
         );
-        assert_eq!(engine.pending_video_half, None);
+        assert!(engine.pending_video_halves.is_empty());
     }
 
     #[test]
     fn decoder_failure_stops_without_restarting_a_loop() {
         let (mut engine, _, _) = looped_video_engine(LoopMode::Looped);
-        engine.current_video.as_mut().unwrap().has_audio = false;
+        engine.videos[0].has_audio = false;
         engine.take_actions();
 
         engine.video_failed(1, 1);
 
-        assert!(engine.current_video.is_none());
+        assert!(engine.videos.is_empty());
         let actions = engine.take_actions();
         assert!(matches!(
             actions.first(),
@@ -2663,7 +2861,7 @@ mod tests {
             "the cue is reaped by its fade completing, not cleared"
         );
         assert!(!engine.active_cues[0].follow_after_last);
-        assert!(engine.current_video.is_none());
+        assert!(engine.videos.is_empty());
         assert!(
             engine.delayed_cues.is_empty(),
             "a delayed cue must not start after a stop all"
@@ -2671,7 +2869,7 @@ mod tests {
         assert!(
             engine.take_actions().iter().any(|action| matches!(
                 action,
-                EngineAction::StopVideo { fade_out_secs } if *fade_out_secs == 2.0
+                EngineAction::StopVideo { fade_out_secs, .. } if *fade_out_secs == 2.0
             )),
             "the video fades over the cue's fade time"
         );
@@ -2714,7 +2912,7 @@ mod tests {
         );
         assert!(actions.iter().any(|action| matches!(
             action,
-            EngineAction::StopVideo { fade_out_secs } if *fade_out_secs == 0.0
+            EngineAction::StopVideo { fade_out_secs, .. } if *fade_out_secs == 0.0
         )));
     }
 
@@ -2753,7 +2951,7 @@ mod tests {
         let (nested, nested_input) = active_audio(2, q(121, 2));
         engine.active_cues.push(direct);
         engine.active_cues.push(nested);
-        engine.current_video = Some(CurrentVideo {
+        engine.videos = vec![CurrentVideo {
             qid: q(11, 1),
             instance_id: 1,
             epoch: 1,
@@ -2766,7 +2964,10 @@ mod tests {
             has_audio: true,
             clock_origin: Duration::ZERO,
             paused_position: None,
-        });
+            layer: 1,
+            region: None,
+            held: false,
+        }];
         engine.delayed_cues.push(DelayedCue {
             cue: member(q(13, 1), Decimal::ONE),
             start_at: Duration::from_secs(5),
@@ -2780,7 +2981,7 @@ mod tests {
 
         assert!(direct_input.is_fading(), "a direct member fades");
         assert!(nested_input.is_fading(), "a nested member fades");
-        assert!(engine.current_video.is_none());
+        assert!(engine.videos.is_empty());
         let delayed = engine
             .delayed_cues
             .iter()
@@ -2794,7 +2995,7 @@ mod tests {
         let actions = engine.take_actions();
         assert!(actions.iter().any(|action| matches!(
             action,
-            EngineAction::StopVideo { fade_out_secs } if *fade_out_secs == 2.0
+            EngineAction::StopVideo { fade_out_secs, .. } if *fade_out_secs == 2.0
         )));
         let stopped = actions
             .iter()
@@ -2813,6 +3014,206 @@ mod tests {
             !stopped.contains(&Decimal::from(9)),
             "another group's member is untouched"
         );
+    }
+
+    fn video_cue(qid: i64, layer: u8, trigger: TriggerMode) -> Cue {
+        Cue::Video {
+            base: cuepool_core::CueBase {
+                qid: Decimal::from(qid),
+                trigger,
+                ..Default::default()
+            },
+            path: format!("clip{qid}.mov"),
+            start_time: Timespan::ZERO,
+            duration: Timespan::ZERO,
+            volume: 1.0,
+            pan: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            fade_type: Default::default(),
+            eq: None,
+            routing: Default::default(),
+            follow_mtc: false,
+            mtc_start: Timespan::ZERO,
+            layer,
+            region: None,
+        }
+    }
+
+    fn video_engine(cues: Vec<Cue>) -> ShowEngine {
+        let app = cuepool_gui::CuePoolApp::new();
+        app.state().lock_unpoisoned().show_file.cues = cues;
+        ShowEngine::new(app.state().clone(), None)
+    }
+
+    fn playing_layers(engine: &ShowEngine) -> Vec<(i64, u8)> {
+        engine
+            .snapshot()
+            .videos
+            .iter()
+            .map(|video| (video.qid.try_into().unwrap(), video.layer))
+            .collect()
+    }
+
+    fn stopped_layers(actions: &[EngineAction]) -> Vec<Option<u8>> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                EngineAction::StopVideo { layer, .. } => Some(*layer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn video_layers_play_together_and_a_video_replaces_only_its_own_layer() {
+        let mut engine = video_engine(vec![
+            video_cue(1, 1, TriggerMode::Go),
+            video_cue(2, 2, TriggerMode::Go),
+            video_cue(3, 1, TriggerMode::Go),
+        ]);
+        engine.command(EngineCommand::Fire(Decimal::from(2)), Duration::ZERO);
+        engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        assert_eq!(playing_layers(&engine), [(1, 1), (2, 2)]);
+
+        let actions = engine.command(EngineCommand::Fire(Decimal::from(3)), Duration::ZERO);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            EngineAction::PlayVideo { layer: 1, qid, .. } if *qid == Decimal::from(3)
+        )));
+        assert_eq!(playing_layers(&engine), [(3, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn with_last_videos_on_two_layers_share_one_clock_origin() {
+        let mut engine = video_engine(vec![
+            video_cue(1, 1, TriggerMode::Go),
+            video_cue(2, 2, TriggerMode::WithLast),
+        ]);
+        engine.command(EngineCommand::Select(Decimal::ONE), Duration::ZERO);
+        let actions = engine.command(EngineCommand::Go, Duration::from_secs(5));
+        let origins = actions
+            .iter()
+            .filter_map(|action| match action {
+                EngineAction::PlayVideo {
+                    layer,
+                    clock_origin,
+                    ..
+                } => Some((*layer, *clock_origin)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            origins,
+            [(1, Duration::from_secs(5)), (2, Duration::from_secs(5))]
+        );
+    }
+
+    #[test]
+    fn stopping_one_video_leaves_the_other_layer_playing() {
+        let mut engine = video_engine(vec![
+            video_cue(1, 1, TriggerMode::Go),
+            video_cue(2, 2, TriggerMode::Go),
+        ]);
+        engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        engine.command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO);
+
+        engine.play_cue(stop_cue(99, Decimal::TWO, false, 1.5));
+        let actions = engine.take_actions();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            EngineAction::StopVideo { layer: Some(2), fade_out_secs } if *fade_out_secs == 1.5
+        )));
+        assert_eq!(stopped_layers(&actions), [Some(2)]);
+        assert_eq!(playing_layers(&engine), [(1, 1)]);
+
+        let actions = engine.command(EngineCommand::Stop, Duration::ZERO);
+        assert_eq!(stopped_layers(&actions), [None]);
+        assert!(engine.snapshot().videos.is_empty());
+    }
+
+    #[test]
+    fn eof_on_one_layer_finishes_only_that_video() {
+        let mut engine = video_engine(vec![
+            video_cue(1, 1, TriggerMode::Go),
+            video_cue(2, 2, TriggerMode::Go),
+            dummy(3, TriggerMode::AfterLast),
+        ]);
+        engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        engine.command(EngineCommand::Fire(Decimal::TWO), Duration::ZERO);
+        let layer_two = engine.snapshot().videos[1].clone();
+
+        let actions = engine.event(
+            EngineEvent::VideoEof {
+                instance_id: layer_two.instance_id,
+                epoch: layer_two.epoch,
+            },
+            Duration::from_secs(3),
+        );
+        assert_eq!(stopped_layers(&actions), [Some(2)]);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            EngineAction::FireExternal(cue) if cue.base().qid == Decimal::from(3)
+        )));
+        assert_eq!(playing_layers(&engine), [(1, 1)]);
+    }
+
+    /// Two audio-backed videos whose pictures end first must each hold their
+    /// own AfterLast follow until their own audio ends.
+    #[test]
+    fn each_video_layer_tracks_its_own_picture_and_audio_halves() {
+        let mut engine = video_engine(vec![
+            dummy(1, TriggerMode::Go),
+            dummy(5, TriggerMode::AfterLast),
+            dummy(2, TriggerMode::Go),
+            dummy(6, TriggerMode::AfterLast),
+        ]);
+        for (instance_id, qid, layer) in [(1, Decimal::ONE, 1), (2, Decimal::TWO, 2)] {
+            engine.active_cues.push(active_audio(instance_id, qid).0);
+            engine.push_video_action(CurrentVideo {
+                qid,
+                instance_id,
+                epoch: 0,
+                path: "clip.mov".into(),
+                start_time: Timespan::ZERO,
+                duration: Timespan::ZERO,
+                loop_mode: LoopMode::OneShot,
+                follow_mtc: false,
+                mtc_start: Timespan::ZERO,
+                has_audio: true,
+                clock_origin: Duration::ZERO,
+                paused_position: None,
+                layer,
+                region: None,
+                held: false,
+            });
+        }
+        engine.take_actions();
+
+        let videos = engine.snapshot().videos;
+        for video in &videos {
+            engine.video_eof(video.instance_id, video.epoch);
+        }
+        assert_eq!(engine.pending_video_halves.len(), 2);
+        assert!(
+            !engine
+                .take_actions()
+                .iter()
+                .any(|action| matches!(action, EngineAction::FireExternal(_)))
+        );
+
+        engine.active_cues[0].state = CueState::Done;
+        engine.check_finished_cues();
+        let fired = engine
+            .take_actions()
+            .iter()
+            .filter_map(|action| match action {
+                EngineAction::FireExternal(cue) => Some(cue.base().qid),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fired, [Decimal::from(5)]);
+        assert_eq!(engine.pending_video_halves, [(Decimal::TWO, 2)]);
     }
 
     fn sound_instance(qid: Decimal, instance_id: u64, fade_out: f32) -> ActiveCue {
@@ -2896,6 +3297,121 @@ mod tests {
         engine.stop_all_faded(3.0, Default::default());
 
         assert!(engine.active_cues.iter().all(|cue| cue.fade_out_started));
+    }
+
+    fn looping_group(loop_mode: LoopMode, loop_count: i32) -> ShowEngine {
+        let member = |qid: i64, layer: u8| {
+            let mut cue = video_cue(qid, layer, TriggerMode::Go);
+            cue.base_mut().parent = Some(Decimal::ONE);
+            // The group owns looping; a member's own loop mode is ignored.
+            cue.base_mut().loop_mode = LoopMode::LoopedInfinite;
+            cue
+        };
+        video_engine(vec![
+            Cue::Group {
+                base: cuepool_core::CueBase {
+                    qid: Decimal::ONE,
+                    loop_mode,
+                    loop_count,
+                    ..Default::default()
+                },
+            },
+            member(2, 1),
+            member(3, 2),
+        ])
+    }
+
+    fn eof(engine: &mut ShowEngine, qid: i64, now: Duration) -> Vec<EngineAction> {
+        let video = engine
+            .snapshot()
+            .videos
+            .into_iter()
+            .find(|video| video.qid == Decimal::from(qid))
+            .expect("member is playing");
+        let mut actions = engine.event(
+            EngineEvent::VideoEof {
+                instance_id: video.instance_id,
+                epoch: video.epoch,
+            },
+            now,
+        );
+        actions.extend(engine.tick(now));
+        actions
+    }
+
+    fn restarts(actions: &[EngineAction]) -> Vec<(u8, Duration)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                EngineAction::PlayVideo {
+                    layer,
+                    clock_origin,
+                    ..
+                } => Some((*layer, *clock_origin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_looping_group_restarts_every_member_together_after_the_longest_ends() {
+        let mut engine = looping_group(LoopMode::LoopedInfinite, 1);
+        let fired = engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        assert_eq!(restarts(&fired), [(1, Duration::ZERO), (2, Duration::ZERO)]);
+
+        // The shorter clip ends first: it holds its last frame and waits.
+        let short_end = eof(&mut engine, 3, Duration::from_secs(3));
+        assert!(stopped_layers(&short_end).is_empty(), "held, not stopped");
+        assert!(restarts(&short_end).is_empty());
+
+        // The longer clip ends: both restart in one tick on one clock origin.
+        let long_end = eof(&mut engine, 2, Duration::from_secs(5));
+        assert_eq!(
+            restarts(&long_end),
+            [(1, Duration::from_secs(5)), (2, Duration::from_secs(5))]
+        );
+        assert!(
+            stopped_layers(&long_end).is_empty(),
+            "no blank between passes"
+        );
+
+        // And again on the next pass.
+        eof(&mut engine, 3, Duration::from_secs(8));
+        let second = eof(&mut engine, 2, Duration::from_secs(10));
+        assert_eq!(
+            restarts(&second),
+            [(1, Duration::from_secs(10)), (2, Duration::from_secs(10))]
+        );
+    }
+
+    #[test]
+    fn a_counted_group_loop_stops_its_members_after_the_last_pass() {
+        let mut engine = looping_group(LoopMode::Looped, 2);
+        engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        eof(&mut engine, 3, Duration::from_secs(1));
+        assert_eq!(
+            restarts(&eof(&mut engine, 2, Duration::from_secs(2))).len(),
+            2
+        );
+
+        eof(&mut engine, 3, Duration::from_secs(3));
+        let last = eof(&mut engine, 2, Duration::from_secs(4));
+        assert!(restarts(&last).is_empty(), "two passes, then done");
+        assert_eq!(stopped_layers(&last), [Some(1), Some(2)]);
+        assert!(last.iter().any(|action| matches!(
+            action,
+            EngineAction::Trace(EngineTrace::CueFinished { qid }) if *qid == Decimal::ONE
+        )));
+        assert!(engine.snapshot().videos.is_empty());
+    }
+
+    #[test]
+    fn stopping_a_looping_group_ends_the_loop() {
+        let mut engine = looping_group(LoopMode::LoopedInfinite, 1);
+        engine.command(EngineCommand::Fire(Decimal::ONE), Duration::ZERO);
+        engine.play_cue(stop_cue(99, Decimal::ONE, false, 0.0));
+        assert!(engine.group_loops.is_empty());
+        assert!(engine.snapshot().videos.is_empty());
     }
 
     #[test]

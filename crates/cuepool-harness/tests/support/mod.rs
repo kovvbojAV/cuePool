@@ -27,6 +27,7 @@ impl Fixture {
         fs::create_dir(&dir)?;
         write_wav(&dir.join("tone.wav"), 4_800)?;
         write_y4m(&dir.join("video.y4m"), 5)?;
+        write_y4m(&dir.join("video-short.y4m"), 3)?;
         write_hap(&dir.join("video-hapq.mov"), 5)?;
         let show = ShowFile {
             cues,
@@ -99,7 +100,20 @@ pub fn video(qid: i64, loop_mode: LoopMode) -> Cue {
         routing: AudioRouting::default(),
         follow_mtc: false,
         mtc_start: Timespan::ZERO,
+        layer: 1,
+        region: None,
     }
+}
+
+/// `video` on a given layer and trigger.
+pub fn layered_video(qid: i64, layer: u8, trigger: TriggerMode, loop_mode: LoopMode) -> Cue {
+    let mut cue = video(qid, loop_mode);
+    cue.base_mut().trigger = trigger;
+    let Cue::Video { layer: slot, .. } = &mut cue else {
+        unreachable!()
+    };
+    *slot = layer;
+    cue
 }
 
 pub fn hap_video(qid: i64, loop_mode: LoopMode) -> Cue {
