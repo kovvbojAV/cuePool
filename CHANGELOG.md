@@ -5,6 +5,20 @@ publications are recorded separately by annotated published/vX.Y.Z Git tags.
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/kovvbojAV/cuePool/compare/v0.13.5...v0.14.0) - 2026-11-21
+
+### Application features
+
+- *(cuepool)* time-window trigger ([#68](https://github.com/kovvbojAV/cuePool/pull/68))
+- *(cuepool)* open projects from Finder; reopen the last project on startup ([#70](https://github.com/kovvbojAV/cuePool/pull/70))
+- *(cuepool)* loop a group as one unit ([#69](https://github.com/kovvbojAV/cuePool/pull/69))
+- *(cuepool)* video layers with per-cue canvas regions ([#63](https://github.com/kovvbojAV/cuePool/pull/63))
+- *(cuepool)* GPU-native NotchLC playback ([#64](https://github.com/kovvbojAV/cuePool/pull/64))
+
+### Application fixes
+
+- *(cuepool)* reliable fullscreen outputs on macOS show machines ([#67](https://github.com/kovvbojAV/cuePool/pull/67))
+
 ## [0.13.5](https://github.com/kovvbojAV/cuePool/compare/v0.13.4...v0.13.5) - 2026-09-24
 
 ### Application fixes
