@@ -54,6 +54,8 @@ use lighting_engine::LightingEngine;
 mod ltc_source;
 use ltc_source::{LtcReceiver, to_mtc_frame_rate};
 #[cfg(target_os = "macos")]
+mod macos_open;
+#[cfg(target_os = "macos")]
 mod macos_quit;
 mod mtc_follow;
 use mtc_follow::MtcFollowState;
@@ -74,7 +76,7 @@ use remote_commands::{
     strip_tcp_prefix, strip_udp_prefix,
 };
 mod settings;
-use settings::{AppProfile, load_settings, save_settings_from_state};
+use settings::{AppProfile, load_settings, save_settings_from_state, settings_from_state};
 mod video_pipeline;
 mod video_timing;
 #[cfg(windows)]
@@ -638,6 +640,8 @@ struct App {
     /// Last `SharedState.project_generation` we acted on. A change means a project
     /// was loaded, so the output windows must rebuild for its projection settings.
     last_project_generation: u64,
+    /// App settings as last written to settings.json.
+    saved_settings: settings::AppSettings,
     /// Throttle the engine-owned active-cue snapshot shared with UI and API readers.
     last_active_cue_publish: Instant,
     /// When the control window was last asked to repaint (throttles its ~60 Hz redraw).
@@ -810,6 +814,7 @@ impl App {
         cuepool: CuePoolApp,
         profile: AppProfile,
     ) -> Self {
+        let saved_settings = settings_from_state(cuepool.state());
         let show_engine = ShowEngine::new(cuepool.state().clone(), None);
         // Protocol settings from project settings (fallback to defaults)
         let (tx_host, osc_rx_port, osc_tx_port, is_remote_host, enable_remote_control) = {
@@ -1094,6 +1099,7 @@ impl App {
             zero_copy,
             hap_acceleration,
             last_project_generation: 0,
+            saved_settings,
             last_active_cue_publish: Instant::now() - Duration::from_secs(1),
             last_control_redraw: std::time::Instant::now(),
             occluded_close_warned: false,
@@ -4729,6 +4735,24 @@ impl ApplicationHandler<AppEvent> for App {
                     window.focus_window();
                 }
             }
+            // Projects opened from Finder take the File > Open path, so an
+            // unsaved show still gets asked about first — in a window the
+            // operator can see.
+            let opened = macos_open::take_pending();
+            if !opened.is_empty() {
+                let mut state = self.cuepool.state().lock_unpoisoned();
+                for path in opened {
+                    state
+                        .command_queue
+                        .push(cuepool_gui::AppCommand::OpenProject { path });
+                }
+                drop(state);
+                if let Some(window) = self.control_window.as_ref() {
+                    window.set_minimized(false);
+                    window.focus_window();
+                    window.request_redraw();
+                }
+            }
         }
 
         let show_status = self
@@ -5139,6 +5163,14 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         if self.dbg_last_log.elapsed() >= std::time::Duration::from_secs(1) {
+            // Written when they change, not only on quit: a show machine is
+            // often switched off rather than quit, and the reopen-last-project
+            // setting is only as good as the recent-files list it reads.
+            let current = settings_from_state(self.cuepool.state());
+            if current != self.saved_settings {
+                settings::save_settings(&self.profile, &current);
+                self.saved_settings = current;
+            }
             let secs = self.dbg_last_log.elapsed().as_secs_f64();
             let (
                 starved_per_sec,
@@ -5605,10 +5637,39 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     let settings = load_settings(&profile);
     {
         let mut state = cuepool.state().lock_unpoisoned();
-        state.recent_files = settings.recent_files;
-        state.last_seen_release_notes = settings.last_seen_release_notes;
+        state.recent_files = settings.recent_files.clone();
+        state.last_seen_release_notes = settings.last_seen_release_notes.clone();
+        state.open_last_project = settings.open_last_project;
     }
-    if let Some(path) = &project_path {
+    let last_project = settings
+        .open_last_project
+        .then(|| settings.recent_files.first().cloned())
+        .flatten();
+    if let (None, Some(path)) = (&project_path, &last_project) {
+        // Unlike --project, a last project that has moved or broken must not
+        // stop the app starting: say so and start empty.
+        match load_startup_project(&cuepool, path) {
+            Ok(()) => log::info!(
+                target: PERSIST_TARGET,
+                "CuePool reopened the last project: path={}",
+                path.display()
+            ),
+            Err(message) => {
+                log::warn!(
+                    target: PERSIST_TARGET,
+                    "CuePool could not reopen the last project {}: {message}",
+                    path.display()
+                );
+                cuepool
+                    .state()
+                    .lock_unpoisoned()
+                    .report_operator_error(format!(
+                        "Could not reopen the last project '{}': {message}",
+                        path.display()
+                    ));
+            }
+        }
+    } else if let Some(path) = &project_path {
         load_startup_project(&cuepool, path).map_err(|message| {
             startup_error(
                 "Could not open project",
@@ -5637,7 +5698,10 @@ fn run(log_file: String, profile: AppProfile) -> anyhow::Result<()> {
     // After the event loop exists, never before: winit registers the delegate
     // class this hooks in `EventLoop::new`.
     #[cfg(target_os = "macos")]
-    macos_quit::install();
+    {
+        macos_quit::install();
+        macos_open::install();
+    }
 
     let make_instance = |backends| {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
