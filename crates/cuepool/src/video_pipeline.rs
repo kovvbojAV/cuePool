@@ -6,7 +6,7 @@ use cuepool_gui::{SharedStateHandle, VideoDiagnostics, VideoTimings};
 use cuepool_video::{
     FramePool, HapAcceleration, HapFallbackSession, VideoFrame, VideoSource, ZeroCopyAvailability,
 };
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use winit::window::WindowId;
@@ -339,6 +339,22 @@ fn update_vsync_interval(
         .clamp(VSYNC_INTERVAL_MIN, VSYNC_INTERVAL_MAX)
 }
 
+/// No two regions overlap, so each layer can be drawn straight into the canvas.
+fn regions_disjoint(regions: impl Iterator<Item = CanvasRect> + Clone) -> bool {
+    regions.clone().enumerate().all(|(i, a)| {
+        regions.clone().skip(i + 1).all(|b| {
+            a.x + a.width <= b.x
+                || b.x + b.width <= a.x
+                || a.y + a.height <= b.y
+                || b.y + b.height <= a.y
+        })
+    })
+}
+
+/// Consume-loop passes allowed to have GPU work outstanding before new frames
+/// are dropped instead of uploaded.
+const MAX_GPU_PASSES_IN_FLIGHT: usize = 2;
+
 /// One video layer's consume-thread state: its decode channel, peeked
 /// frame, converters and region-sized texture. Moved out for each pass of
 /// the consume loop and put back after it.
@@ -358,6 +374,9 @@ struct LayerState {
     notchlc_converter: Option<cuepool_video::NotchLcConverter>,
     // This layer's picture, sized to its clamped region.
     texture: Option<cuepool_video::CanvasTexture>,
+    // The newest frame went straight into the canvas (fast path), so `texture`
+    // is behind; it is refreshed from the canvas before the next composite.
+    stale: bool,
 }
 
 /// Video consume thread: owns the canvas/overlay textures, the YUV converter,
@@ -392,6 +411,8 @@ pub(crate) fn video_consume_thread(
     let mut overlay: Option<cuepool_video::CanvasTexture> = None;
     let mut layers: [LayerState; VIDEO_LAYERS] = Default::default();
     let mut compositor: Option<cuepool_video::LayerCompositor> = None;
+    // Consume-loop passes whose GPU work has not finished yet.
+    let gpu_in_flight = Arc::new(AtomicUsize::new(0));
     // Layers (index, region, opacity) drawn by the last composite; any change
     // (a layer starting/stopping, a region edit, a fade step) recomposites.
     let mut last_drawn: Vec<(usize, CanvasRect, f32)> = Vec::new();
@@ -504,8 +525,42 @@ pub(crate) fn video_consume_thread(
         }
 
         let mut composite_dirty = views_dirty;
+        let mut submitted_gpu_work = false;
+        // Every upload holds a staging copy until the GPU has used it. When the
+        // GPU falls behind (two 4K60 layers plus two 4K outputs on an M1),
+        // queuing regardless ballooned memory into swap and stalled every
+        // output; dropping the frame instead keeps the backlog bounded.
+        if gpu_in_flight.load(Ordering::Acquire) >= MAX_GPU_PASSES_IN_FLIGHT {
+            // Deliver completion callbacks even if nothing else is submitting
+            // (no output windows open); non-blocking, and only while behind.
+            let _ = device.poll(wgpu::PollType::Poll);
+        }
+        let gpu_backlog = gpu_in_flight.load(Ordering::Acquire) >= MAX_GPU_PASSES_IN_FLIGHT;
         // Shortest wait any live layer asks for; idle/paused falls back to 2 ms.
         let mut next_wake: Option<Duration> = None;
+
+        // Fast path: while the layers last composited are opaque, don't overlap
+        // and none is fading, each converts its new frame straight into its
+        // region of the canvas and the full-canvas composite is skipped —
+        // that pass was ~40% of the GPU on the two-4K-layer Mac mini rig.
+        let fading = control
+            .lock_unpoisoned()
+            .layers
+            .iter()
+            .any(|stream| stream.fade.is_some());
+        let direct: Vec<(usize, CanvasRect)> = if !views_dirty
+            && !fading
+            && canvas.is_some()
+            && last_drawn.iter().all(|(_, _, opacity)| *opacity >= 1.0)
+            && regions_disjoint(last_drawn.iter().map(|(_, region, _)| *region))
+        {
+            last_drawn
+                .iter()
+                .map(|(li, region, _)| (*li, *region))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // ── Per-layer streams: handshake, due-frame selection, upload ──
         for (li, layer) in layers.iter_mut().enumerate() {
@@ -520,6 +575,7 @@ pub(crate) fn video_consume_thread(
                 mut hap_converter,
                 mut notchlc_converter,
                 mut texture,
+                mut stale,
             } = std::mem::take(layer);
 
             // Each layer renders into its own region-sized texture, so the
@@ -530,7 +586,7 @@ pub(crate) fn video_consume_thread(
                 let ctl = control.lock_unpoisoned();
                 (ctl.layers[li].region, ctl.layers[li].clock.is_some())
             };
-            match canvas.as_ref() {
+            let layer_region = match canvas.as_ref() {
                 Some(c) if live => {
                     let region = region.map_or(CanvasRect::full(c.width, c.height), |region| {
                         region.clamped(c.width, c.height)
@@ -544,10 +600,22 @@ pub(crate) fn video_consume_thread(
                             region.width,
                             region.height,
                         ));
+                        stale = false;
                     }
+                    Some(region)
                 }
-                _ => texture = None,
-            }
+                _ => {
+                    texture = None;
+                    stale = false;
+                    None
+                }
+            };
+            // This layer's fast-path target: its region in the canvas, if it
+            // was in the last composite at the same place.
+            let direct_region = direct
+                .iter()
+                .find(|(i, region)| *i == li && Some(*region) == layer_region)
+                .map(|(_, region)| [region.x, region.y, region.width, region.height]);
 
             let mut terminal = None;
 
@@ -733,6 +801,10 @@ pub(crate) fn video_consume_thread(
                     }
                 }
             }
+            if gpu_backlog && let Some(frame) = consumed.take() {
+                frame_pool.recycle_frame(frame);
+                dropped += 1;
+            }
             if dropped != 0 {
                 control.lock_unpoisoned().dropped += dropped;
             }
@@ -760,6 +832,7 @@ pub(crate) fn video_consume_thread(
                 #[cfg(windows)]
                 let mut direct_submitted = false;
                 let mut uploaded = false;
+                let mut uploaded_direct = false;
                 match &frame.pixels {
                     cuepool_video::FramePixels::Rgba(_) => {
                         if let Some(c) = texture.as_ref() {
@@ -801,7 +874,17 @@ pub(crate) fn video_consume_thread(
                                             label: Some("canvas-hap-convert"),
                                         },
                                     );
-                                    conv.encode(&mut encoder, &c.render_view());
+                                    match (direct_region, canvas.as_ref()) {
+                                        (Some(rect), Some(target)) => {
+                                            conv.encode_region(
+                                                &mut encoder,
+                                                &target.render_view(),
+                                                Some(rect),
+                                            );
+                                            uploaded_direct = true;
+                                        }
+                                        _ => conv.encode(&mut encoder, &c.render_view()),
+                                    }
                                     queue.submit(std::iter::once(encoder.finish()));
                                     timings.conversion_submit.set_ms(
                                         conversion_submit_timing
@@ -848,7 +931,18 @@ pub(crate) fn video_consume_thread(
                                     );
                                     // Decode dispatch and fit pass share the encoder,
                                     // so this stays one submit, as the HAP path is.
-                                    conv.encode(&device, &mut encoder, &c.render_view());
+                                    match (direct_region, canvas.as_ref()) {
+                                        (Some(rect), Some(target)) => {
+                                            conv.encode_region(
+                                                &device,
+                                                &mut encoder,
+                                                &target.render_view(),
+                                                Some(rect),
+                                            );
+                                            uploaded_direct = true;
+                                        }
+                                        _ => conv.encode(&device, &mut encoder, &c.render_view()),
+                                    }
                                     queue.submit(std::iter::once(encoder.finish()));
                                     timings.conversion_submit.set_ms(
                                         conversion_submit_timing
@@ -1018,7 +1112,17 @@ pub(crate) fn video_consume_thread(
                                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                     label: Some("canvas-yuv-convert"),
                                 });
-                            conv.encode(&mut encoder, &c.render_view());
+                            match (direct_region, canvas.as_ref()) {
+                                (Some(rect), Some(target)) => {
+                                    conv.encode_region(
+                                        &mut encoder,
+                                        &target.render_view(),
+                                        Some(rect),
+                                    );
+                                    uploaded_direct = true;
+                                }
+                                _ => conv.encode(&mut encoder, &c.render_view()),
+                            }
                             queue.submit(std::iter::once(encoder.finish()));
                             timings.conversion_submit.set_ms(
                                 conversion_submit_timing.record(conversion_started.elapsed()),
@@ -1027,7 +1131,12 @@ pub(crate) fn video_consume_thread(
                         }
                     }
                 }
-                composite_dirty |= uploaded;
+                // A frame drawn straight into the canvas needs no composite.
+                composite_dirty |= uploaded && !uploaded_direct;
+                submitted_gpu_work |= uploaded;
+                if uploaded {
+                    stale = uploaded_direct;
+                }
                 let mut ctl = control.lock_unpoisoned();
                 if uploaded {
                     ctl.uploads += 1;
@@ -1133,6 +1242,7 @@ pub(crate) fn video_consume_thread(
                 hap_converter,
                 notchlc_converter,
                 texture,
+                stale,
             };
         }
         woke_on_vsync = false;
@@ -1188,12 +1298,61 @@ pub(crate) fn video_consume_thread(
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("canvas-layer-composite"),
                 });
+                // Fast-path layers' newest frames live in the canvas: copy them
+                // back into their textures before the composite redraws from
+                // those. A recreated canvas has nothing to copy.
+                for (li, region, _) in &last_drawn {
+                    let layer = &layers[*li];
+                    if let (true, false, Some(texture)) =
+                        (layer.stale, views_dirty, layer.texture.as_ref())
+                        && (texture.width, texture.height) == (region.width, region.height)
+                    {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: c.texture(),
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: region.x,
+                                    y: region.y,
+                                    z: 0,
+                                },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: texture.texture(),
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: region.width,
+                                height: region.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
+                }
+                for layer in &mut layers {
+                    layer.stale = false;
+                }
                 compositor.encode(&device, &mut encoder, &c.render_view(), &draws);
                 // ponytail: its own submit after the conversions; fold into the
                 // last conversion's encoder if conversion_submit timings regress.
                 queue.submit(std::iter::once(encoder.finish()));
                 last_drawn = drawn;
+                submitted_gpu_work = true;
             }
+        }
+
+        // Count this pass until the GPU finishes everything submitted so far.
+        // The callback fires from a later submit on the shared queue (the output
+        // threads submit every frame) or from the poll above.
+        if submitted_gpu_work {
+            gpu_in_flight.fetch_add(1, Ordering::AcqRel);
+            let done = Arc::clone(&gpu_in_flight);
+            queue.queue().on_submitted_work_done(move || {
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
         }
 
         // ── Publish the frame-state bundle (change-detect + generation bump) ──
@@ -1928,6 +2087,21 @@ pub(crate) fn pixmap_decode_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_by_side_regions_are_disjoint_and_overlaps_are_not() {
+        let rect = |x, y, width, height| CanvasRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let halves = [rect(0, 0, 3840, 2160), rect(3840, 0, 3840, 2160)];
+        assert!(regions_disjoint(halves.iter().copied()));
+        let overlapping = [rect(0, 0, 3840, 2160), rect(3000, 0, 3840, 2160)];
+        assert!(!regions_disjoint(overlapping.iter().copied()));
+        assert!(regions_disjoint(std::iter::empty()));
+    }
 
     #[test]
     fn timing_averages_the_last_fifty_samples() {

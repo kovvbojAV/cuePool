@@ -366,6 +366,18 @@ impl YuvConverter {
     /// non-sRGB view so the matrix output is stored verbatim). Requires a prior
     /// `upload`; no-op if nothing has been uploaded yet.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, canvas_view: &TextureView) {
+        self.encode_region(encoder, canvas_view, None);
+    }
+
+    /// Draw only into `viewport` (`[x, y, width, height]` pixels) of `view`,
+    /// keeping the rest of it: the fit and letterbox apply within that rect.
+    /// `None` clears and fills the whole view, like [`Self::encode`].
+    pub fn encode_region(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        canvas_view: &TextureView,
+        viewport: Option<[u32; 4]>,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("yuv-convert-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -373,7 +385,11 @@ impl YuvConverter {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: if viewport.is_some() {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                    },
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -383,6 +399,9 @@ impl YuvConverter {
             multiview_mask: None,
         });
 
+        if let Some([x, y, width, height]) = viewport {
+            pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+        }
         match self.active.as_ref() {
             Some(ActiveBinding::Planar(binding)) => {
                 pass.set_pipeline(&self.planar_pipeline);
@@ -944,6 +963,120 @@ mod tests {
             stride,
             width,
             height,
+        }
+    }
+
+    /// Drawing into a region keeps the rest of the target: the fast path
+    /// converts each layer straight into its part of the shared canvas.
+    #[test]
+    fn encode_region_draws_only_inside_the_viewport() {
+        let _gpu = crate::gpu_test_lock();
+        let Some((device, queue)) = crate::test_device_queue(wgpu::Features::empty()) else {
+            return;
+        };
+        let (w, h) = (8u32, 4u32);
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("region-test-target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 0, 0, 255].repeat((w * h) as usize),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        // Full-range mid grey, fitted to the 4x4 region.
+        let mut conv = YuvConverter::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let frame = VideoFrame::yuv_planar(
+            4,
+            4,
+            0.0,
+            ChromaSubsample::Cs420,
+            BitDepth::B8,
+            plane(vec![128u8; 4 * 4], 4, 4),
+            plane(vec![128u8; 2 * 2], 2, 2),
+            plane(vec![128u8; 2 * 2], 2, 2),
+            true,
+            true,
+        );
+        conv.upload(&device, &queue, &frame, [4, 4], CanvasFit::Stretch);
+        let bytes_per_row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("region-test-readback"),
+            size: u64::from(bytes_per_row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        conv.encode_region(
+            &mut encoder,
+            &target.create_view(&Default::default()),
+            Some([4, 0, 4, 4]),
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range().expect("mapped range").to_vec();
+        for row in 0..h {
+            for col in 0..w {
+                let i = (row * bytes_per_row + col * 4) as usize;
+                let px = &data[i..i + 3];
+                if col < 4 {
+                    assert_eq!(px, [255, 0, 0], "left half kept at ({col},{row})");
+                } else {
+                    assert!(
+                        px.iter().all(|c| (120..=136).contains(c)),
+                        "right half grey at ({col},{row}): {px:?}"
+                    );
+                }
+            }
         }
     }
 

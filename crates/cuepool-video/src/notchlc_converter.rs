@@ -217,6 +217,19 @@ impl NotchLcConverter {
         encoder: &mut wgpu::CommandEncoder,
         canvas_view: &TextureView,
     ) {
+        self.encode_region(device, encoder, canvas_view, None);
+    }
+
+    /// Draw only into `viewport` (`[x, y, width, height]` pixels) of `view`,
+    /// keeping the rest of it: the fit and letterbox apply within that rect.
+    /// `None` clears and fills the whole view, like [`Self::encode`].
+    pub fn encode_region(
+        &mut self,
+        device: &Device,
+        encoder: &mut wgpu::CommandEncoder,
+        canvas_view: &TextureView,
+        viewport: Option<[u32; 4]>,
+    ) {
         if !self.staged {
             return;
         }
@@ -259,7 +272,11 @@ impl NotchLcConverter {
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: if viewport.is_some() {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                    },
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -268,6 +285,9 @@ impl NotchLcConverter {
             timestamp_writes: None,
             multiview_mask: None,
         });
+        if let Some([x, y, width, height]) = viewport {
+            pass.set_viewport(x as f32, y as f32, width as f32, height as f32, 0.0, 1.0);
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
         pass.draw(0..3, 0..1);
