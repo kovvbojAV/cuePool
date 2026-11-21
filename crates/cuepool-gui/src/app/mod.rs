@@ -24,7 +24,7 @@ const MAX_AUTOMATION_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
 /// the previous release's copy with the new version. `release_notes_match_the_release`
 /// fails while this trails the package minor, which is the reminder to rewrite
 /// the modal body before bumping it (see AGENTS.md).
-pub const RELEASE_NOTES_VERSION: &str = "0.13";
+pub const RELEASE_NOTES_VERSION: &str = "0.14";
 
 /// A full snapshot of editable state for undo/redo.
 #[derive(Debug, Clone)]
@@ -2370,9 +2370,9 @@ impl CuePoolApp {
                         .color(egui::Color32::from_rgb(255, 184, 92)),
                 );
                 ui.add_space(4.0);
-                ui.heading("Versioned installs and clearer build details");
+                ui.heading("Video layers and unattended shows");
                 ui.label(
-                    "Install a published CuePool release on Windows, check exactly which build is running, and keep remote volume controls in sync with the show.",
+                    "Play several videos side by side on one output, loop them in step, and have a show start by itself at set hours.",
                 );
                 ui.add_space(12.0);
                 ui.separator();
@@ -2380,16 +2380,20 @@ impl CuePoolApp {
 
                 for (title, detail) in [
                     (
-                        "Windows installers and portable packages",
-                        "Each release includes an MSI installer and a portable ZIP with the required runtime libraries and ASIO support. Your audio device's ASIO driver is still installed separately.",
+                        "Video layers",
+                        "Give a video cue a layer (1 to 4) and an area of the canvas in the inspector, or use Left half and Right half. Videos on different layers play together, frame-synced, higher layers on top, and each starts and stops as its own cue.",
                     ),
                     (
-                        "Check the running build",
-                        "Help > About shows the version and source revision. Help > Changes lists changes from the available release or version-tag baseline, including local edits in development builds.",
+                        "Loop a group as one unit",
+                        "A looped Group restarts all its videos together when the longest one ends, so clips of slightly different lengths stay in step.",
                     ),
                     (
-                        "Master-volume feedback over OSC",
-                        "Remote controls can query the current master volume and receive updates when it changes. The included Nodel volume control follows changes made in CuePool.",
+                        "Time Window trigger",
+                        "Triggers > Time Window plays a cue between two times each day. If CuePool starts inside the window, the cue starts; at the end it fades out. A Stop holds until the next window.",
+                    ),
+                    (
+                        "Open shows from Finder, or on startup",
+                        "On macOS, double-click a .qproj to open it. Project Settings > This Computer > Open last project on startup reopens the last show when CuePool starts without one.",
                     ),
                 ] {
                     ui.label(
@@ -2403,7 +2407,7 @@ impl CuePoolApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Also: a final Stop All cue no longer rearms the show clock.",
+                        "Also: NotchLC video decodes on the GPU, with correct colour. Fullscreen outputs on macOS stay on their own screens, hide the pointer and recover when they stop keeping up with the display.",
                     )
                     .small()
                     .color(egui::Color32::from_gray(180)),
