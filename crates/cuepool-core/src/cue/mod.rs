@@ -303,6 +303,13 @@ pub enum Cue {
         /// program starts at 01:00:00:00).
         #[serde(default = "default_mtc_start")]
         mtc_start: Timespan,
+        /// Video layer, 1..=[`MAX_VIDEO_LAYERS`]. A video replaces whatever plays
+        /// on its layer; different layers play together, higher on top.
+        #[serde(default = "default_video_layer")]
+        layer: u8,
+        /// Where on the canvas this layer draws; `None` = the whole canvas.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<crate::projection::CanvasRect>,
     },
 
     // `alias` keeps pre-rename showfiles loading; new saves write "NetworkCue".
@@ -553,6 +560,13 @@ fn default_mtc_start() -> Timespan {
     Timespan::from_secs_f64(3600.0)
 }
 
+/// Number of video layers that can play at once.
+pub const MAX_VIDEO_LAYERS: u8 = 4;
+
+pub fn default_video_layer() -> u8 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +706,13 @@ mod tests {
             routing: AudioRouting::default(),
             follow_mtc: false,
             mtc_start: Timespan::from_secs_f64(3600.0),
+            layer: 2,
+            region: Some(crate::projection::CanvasRect {
+                x: 960,
+                y: 0,
+                width: 960,
+                height: 1080,
+            }),
         };
         let json = serde_json::to_string(&cue).unwrap();
         let de: Cue = serde_json::from_str(&json).unwrap();
@@ -732,10 +753,15 @@ mod tests {
             Cue::Video {
                 follow_mtc,
                 mtc_start,
+                layer,
+                region,
                 ..
             } => {
                 assert!(!follow_mtc);
                 assert_eq!(mtc_start, Timespan::from_secs_f64(3600.0));
+                // Pre-layer shows play full canvas on the base layer.
+                assert_eq!(layer, 1);
+                assert_eq!(region, None);
             }
             other => panic!("expected VideoCue, got {:?}", other),
         }

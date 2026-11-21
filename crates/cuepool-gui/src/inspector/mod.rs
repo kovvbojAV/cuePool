@@ -144,6 +144,10 @@ fn show_inner(ui: &mut egui::Ui, state: &SharedStateHandle) {
         .collect();
     let mut lighting_live = state.lighting_live;
     let tc_fps = state.show_file.show_settings.timecode_fps;
+    let canvas_size = (
+        state.show_file.projection.canvas_width,
+        state.show_file.projection.canvas_height,
+    );
 
     // Remote-node context, snapshotted before the cue is mutably borrowed so the
     // Remote Node field can be validated against the machines actually on the
@@ -497,6 +501,8 @@ fn show_inner(ui: &mut egui::Ui, state: &SharedStateHandle) {
             routing,
             follow_mtc,
             mtc_start,
+            layer,
+            region,
         } => {
             ui.label(RichText::new("Video Cue").monospace().size(12.0));
             ui.horizontal(|ui| {
@@ -587,6 +593,7 @@ fn show_inner(ui: &mut egui::Ui, state: &SharedStateHandle) {
                     }
                 });
             });
+            video_placement_editor(ui, layer, region, canvas_size, &mut changed);
             eq_editor(ui, eq, &mut changed);
             routing_editor(ui, routing, &mut changed);
             triggers_editor(
@@ -1310,6 +1317,66 @@ fn qid_edit(ui: &mut egui::Ui, salt: &str, value: &mut Decimal) -> bool {
 /// clock display; also accepts plain seconds). Same commit-on-blur scheme as
 /// [`qid_edit`] — see there for why the live text lives in egui temp storage.
 /// Returns `true` if the value changed.
+/// Layer number and canvas region for a video cue.
+fn video_placement_editor(
+    ui: &mut egui::Ui,
+    layer: &mut u8,
+    region: &mut Option<cuepool_core::CanvasRect>,
+    (canvas_w, canvas_h): (u32, u32),
+    changed: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.label("Layer:");
+        *changed |= ui
+            .add(egui::DragValue::new(layer).range(1..=cuepool_core::MAX_VIDEO_LAYERS))
+            .on_hover_text(
+                "A video replaces whatever plays on its layer. Videos on different \
+                 layers play together; higher layers draw on top.",
+            )
+            .changed();
+    });
+    let mut full = region.is_none();
+    if ui.checkbox(&mut full, "Full canvas").changed() {
+        *region = (!full).then(|| cuepool_core::CanvasRect::full(canvas_w, canvas_h));
+        *changed = true;
+    }
+    let Some(rect) = region.as_mut() else { return };
+    ui.horizontal(|ui| {
+        for (label, value, max) in [
+            ("X", &mut rect.x, canvas_w),
+            ("Y", &mut rect.y, canvas_h),
+            ("W", &mut rect.width, canvas_w),
+            ("H", &mut rect.height, canvas_h),
+        ] {
+            ui.label(label);
+            *changed |= ui
+                .add(egui::DragValue::new(value).range(0..=max).suffix(" px"))
+                .changed();
+        }
+    });
+    ui.horizontal(|ui| {
+        let half = canvas_w / 2;
+        if ui.button("Left half").clicked() {
+            *rect = cuepool_core::CanvasRect {
+                x: 0,
+                y: 0,
+                width: half,
+                height: canvas_h,
+            };
+            *changed = true;
+        }
+        if ui.button("Right half").clicked() {
+            *rect = cuepool_core::CanvasRect {
+                x: half,
+                y: 0,
+                width: canvas_w - half,
+                height: canvas_h,
+            };
+            *changed = true;
+        }
+    });
+}
+
 pub(crate) fn timecode_edit(ui: &mut egui::Ui, salt: &str, value: &mut f64, fps: f32) -> bool {
     let id = ui.make_persistent_id(salt);
     // Pending edit: (in-progress text, model value when the edit started).

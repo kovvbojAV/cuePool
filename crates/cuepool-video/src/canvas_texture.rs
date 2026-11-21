@@ -30,6 +30,7 @@ impl CanvasTexture {
             format: TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[TextureFormat::Rgba8UnormSrgb],
         });
@@ -39,6 +40,11 @@ impl CanvasTexture {
             width,
             height,
         }
+    }
+
+    /// The texture itself, for GPU copies between canvases.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.texture
     }
 
     /// Recreate the texture at a new size.
