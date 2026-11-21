@@ -74,6 +74,8 @@ pub struct CueTriggers {
     pub wall_clock: Option<WallClockTrigger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timecode: Option<TimecodeTrigger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_window: Option<TimeWindowTrigger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +114,18 @@ pub enum RepeatMode {
     #[default]
     Daily,
     Once,
+}
+
+/// Daily on-air window. While the clock is inside `from..to` the cue fires
+/// once (so a machine that boots late still starts it) and it stops at `to`.
+/// `to` at or before `from` wraps past midnight. Times use the wall-clock
+/// trigger's formats.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimeWindowTrigger {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub mode: ClockMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -943,6 +957,11 @@ mod tests {
             }),
             timecode: Some(TimecodeTrigger {
                 time: Timespan::from_secs_f64(10.0),
+            }),
+            time_window: Some(TimeWindowTrigger {
+                from: "09:30:00".into(),
+                to: "17:00:00".into(),
+                mode: ClockMode::TwentyFourHour,
             }),
         };
         let cue = Cue::Dummy {

@@ -444,9 +444,7 @@ fn due_wall_clock_cues(
         .filter(|c| c.enabled())
         .filter_map(|c| {
             let trigger = c.base().triggers.wall_clock.as_ref()?;
-            let target = chrono::NaiveTime::parse_from_str(&trigger.time, "%H:%M:%S")
-                .or_else(|_| chrono::NaiveTime::parse_from_str(&trigger.time, "%I:%M:%S %p"))
-                .ok()?;
+            let target = parse_clock_time(&trigger.time)?;
             if now.signed_duration_since(target).num_seconds().abs() > 1 {
                 return None;
             }
@@ -458,6 +456,78 @@ fn due_wall_clock_cues(
             }
         })
         .collect()
+}
+
+/// A wall-clock time in either trigger format ("21:30:00" or "09:30:00 PM").
+fn parse_clock_time(text: &str) -> Option<chrono::NaiveTime> {
+    chrono::NaiveTime::parse_from_str(text, "%H:%M:%S")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%I:%M:%S %p"))
+        .ok()
+}
+
+/// The date the `from..to` window containing `now` opened, or None outside
+/// it. `to` at or before `from` wraps midnight, so 01:00 inside 22:00–02:00
+/// belongs to the window that opened yesterday.
+fn time_window_opened(
+    from: chrono::NaiveTime,
+    to: chrono::NaiveTime,
+    today: chrono::NaiveDate,
+    now: chrono::NaiveTime,
+) -> Option<chrono::NaiveDate> {
+    if from < to {
+        (from <= now && now < to).then_some(today)
+    } else if now >= from {
+        Some(today)
+    } else if now < to {
+        today.pred_opt()
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TimeWindowAction {
+    Fire(rust_decimal::Decimal),
+    Stop(rust_decimal::Decimal),
+}
+
+/// Time-window triggers at `now`. `windows` records, per cue, the window it
+/// is inside (by opening date). Entering a window fires the cue unless it is
+/// already playing — once per window, so an operator's Stop sticks; leaving
+/// it stops the cue if it is still playing.
+// ponytail: `windows` lives in memory, so a restart mid-window fires the cue
+// again — wanted after a crash. Persist it if a manual Stop must survive one.
+fn time_window_actions(
+    cues: &[cuepool_core::Cue],
+    today: chrono::NaiveDate,
+    now: chrono::NaiveTime,
+    windows: &mut std::collections::HashMap<rust_decimal::Decimal, chrono::NaiveDate>,
+    is_active: impl Fn(rust_decimal::Decimal) -> bool,
+) -> Vec<TimeWindowAction> {
+    let mut actions = Vec::new();
+    for cue in cues.iter().filter(|cue| cue.enabled()) {
+        let qid = cue.base().qid;
+        let Some(window) = cue.base().triggers.time_window.as_ref() else {
+            continue;
+        };
+        let (Some(from), Some(to)) = (parse_clock_time(&window.from), parse_clock_time(&window.to))
+        else {
+            continue;
+        };
+        match time_window_opened(from, to, today, now) {
+            Some(opened) if windows.get(&qid) != Some(&opened) => {
+                windows.insert(qid, opened);
+                if !is_active(qid) {
+                    actions.push(TimeWindowAction::Fire(qid));
+                }
+            }
+            None if windows.remove(&qid).is_some() && is_active(qid) => {
+                actions.push(TimeWindowAction::Stop(qid));
+            }
+            _ => {}
+        }
+    }
+    actions
 }
 
 /// Timecode triggers due at `elapsed` show seconds that have not fired.
@@ -742,6 +812,8 @@ struct App {
     // ── trigger state ──
     wall_clock_fired:
         std::collections::HashMap<rust_decimal::Decimal, (chrono::NaiveDate, chrono::NaiveTime)>,
+    /// Time-window trigger state: the window each cue is inside, by opening date.
+    time_windows: std::collections::HashMap<rust_decimal::Decimal, chrono::NaiveDate>,
     timecode_fired: std::collections::HashSet<rust_decimal::Decimal>,
 
     // ── polish ──
@@ -1149,6 +1221,7 @@ impl App {
             pixmap_pause_flag: Arc::new(AtomicBool::new(false)),
             current_pixmap_qid: None,
             wall_clock_fired: std::collections::HashMap::new(),
+            time_windows: std::collections::HashMap::new(),
             timecode_fired: std::collections::HashSet::new(),
         };
         app.apply_audio_settings();
@@ -3552,6 +3625,41 @@ impl App {
         }
     }
 
+    /// Fire cues entering their time window and stop cues leaving it.
+    fn poll_time_window_triggers(&mut self, event_loop: &ActiveEventLoop) {
+        let now = chrono::Local::now();
+        let actions = {
+            let Ok(state) = self.cuepool.state().lock() else {
+                return;
+            };
+            let engine = &self.show_engine;
+            let (text, pixmap) = (self.current_text_qid, self.current_pixmap_qid);
+            time_window_actions(
+                &state.show_file.cues,
+                now.date_naive(),
+                now.time(),
+                &mut self.time_windows,
+                |qid| engine.is_cue_active(qid) || text == Some(qid) || pixmap == Some(qid),
+            )
+        };
+        for action in actions {
+            match action {
+                TimeWindowAction::Fire(qid) => {
+                    log::info!("Time window opened: firing Q{qid}");
+                    self.play_cue_by_qid(qid, event_loop);
+                }
+                TimeWindowAction::Stop(qid) => {
+                    log::info!("Time window closed: stopping Q{qid}");
+                    if let Err(error) =
+                        self.run_engine_command(EngineCommand::StopCue(qid), event_loop)
+                    {
+                        log::error!("Stopping Q{qid} at its window end failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Poll timecode triggers against the show clock; publishes the clock and
     /// the next armed trigger to the GUI. The clock is frozen while paused
     /// (see [`Self::show_elapsed`]) and triggers never fire mid-pause.
@@ -4927,6 +5035,7 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
         self.poll_wall_clock_triggers(event_loop);
+        self.poll_time_window_triggers(event_loop);
         self.poll_timecode_triggers(event_loop);
         self.tick_engine(event_loop);
         self.upload_pixmap_frames();
@@ -5968,6 +6077,84 @@ mod tests {
             repeat,
         });
         cuepool_core::Cue::Dummy { base }
+    }
+
+    fn window_cue(qid: i64, from: &str, to: &str) -> cuepool_core::Cue {
+        let mut base = cuepool_core::CueBase {
+            qid: rust_decimal::Decimal::from(qid),
+            ..Default::default()
+        };
+        base.triggers.time_window = Some(cuepool_core::TimeWindowTrigger {
+            from: from.into(),
+            to: to.into(),
+            mode: Default::default(),
+        });
+        cuepool_core::Cue::Dummy { base }
+    }
+
+    fn at(hms: &str) -> chrono::NaiveTime {
+        chrono::NaiveTime::parse_from_str(hms, "%H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn a_time_window_fires_once_on_a_late_start_and_stops_at_its_end() {
+        use std::cell::Cell;
+        let q = rust_decimal::Decimal::from(7);
+        let cues = vec![window_cue(7, "09:30:00", "17:00:00")];
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+        let mut windows = Default::default();
+        let playing = Cell::new(false);
+
+        // Before the window: nothing.
+        let early = time_window_actions(&cues, today, at("09:29:59"), &mut windows, |_| false);
+        assert!(early.is_empty());
+        // The machine boots at 9:31, inside the window: fire it.
+        let late = time_window_actions(&cues, today, at("09:31:00"), &mut windows, |_| {
+            playing.get()
+        });
+        assert_eq!(late, [TimeWindowAction::Fire(q)]);
+        // The operator stops it mid-window: the Stop sticks.
+        let again = time_window_actions(&cues, today, at("12:00:00"), &mut windows, |_| false);
+        assert!(again.is_empty(), "fires once per window");
+        // Playing at To: stop it.
+        playing.set(true);
+        let end = time_window_actions(&cues, today, at("17:00:00"), &mut windows, |_| {
+            playing.get()
+        });
+        assert_eq!(end, [TimeWindowAction::Stop(q)]);
+        // Next day's window fires again.
+        let tomorrow = today.succ_opt().unwrap();
+        let next = time_window_actions(&cues, tomorrow, at("09:30:00"), &mut windows, |_| false);
+        assert_eq!(next, [TimeWindowAction::Fire(q)]);
+    }
+
+    #[test]
+    fn a_time_window_does_not_refire_a_playing_cue_and_wraps_midnight() {
+        let q = rust_decimal::Decimal::from(3);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+
+        // Already playing (fired by hand) when the window opens: leave it.
+        let cues = vec![window_cue(3, "09:30:00", "17:00:00")];
+        let mut windows = Default::default();
+        assert!(
+            time_window_actions(&cues, today, at("09:30:00"), &mut windows, |_| true).is_empty()
+        );
+
+        // 22:00–02:00: 01:00 belongs to the window that opened yesterday, so
+        // a cue fired at 23:00 is not fired again after midnight.
+        let overnight = vec![window_cue(3, "22:00:00", "02:00:00")];
+        let mut windows = Default::default();
+        let open = time_window_actions(&overnight, today, at("23:00:00"), &mut windows, |_| false);
+        assert_eq!(open, [TimeWindowAction::Fire(q)]);
+        let tomorrow = today.succ_opt().unwrap();
+        let after_midnight =
+            time_window_actions(&overnight, tomorrow, at("01:00:00"), &mut windows, |_| {
+                false
+            });
+        assert!(after_midnight.is_empty());
+        let closed =
+            time_window_actions(&overnight, tomorrow, at("02:00:00"), &mut windows, |_| true);
+        assert_eq!(closed, [TimeWindowAction::Stop(q)]);
     }
 
     #[test]

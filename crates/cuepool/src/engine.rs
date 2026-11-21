@@ -33,6 +33,9 @@ pub enum EngineCommand {
         volume: f32,
         pan: f32,
     },
+    /// Stop one cue (a group with its members) using the cue's own fade-out,
+    /// as a Stop cue aimed at it with that fade would.
+    StopCue(Decimal),
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +336,7 @@ impl ShowEngine {
             EngineCommand::Preload => self.preload(),
             EngineCommand::Seek { instance_id, secs } => self.seek(instance_id, secs),
             EngineCommand::SetLevel { qid, volume, pan } => self.set_level(qid, volume, pan),
+            EngineCommand::StopCue(qid) => self.stop_cue(qid),
         }
         self.take_actions()
     }
@@ -1002,6 +1006,35 @@ impl ShowEngine {
             });
         }
         Some(instance_id)
+    }
+
+    /// Whether the cue is playing (or paused) here: audio, video or a still.
+    pub fn is_cue_active(&self, qid: Decimal) -> bool {
+        self.cue_is_active(qid)
+    }
+
+    fn stop_cue(&mut self, qid: Decimal) {
+        let (fade_out, fade_type) = self
+            .state
+            .lock_unpoisoned()
+            .show_file
+            .cues
+            .iter()
+            .find(|cue| cue.base().qid == qid)
+            .map_or((0.0, Default::default()), |cue| match cue {
+                Cue::Sound {
+                    fade_out,
+                    fade_type,
+                    ..
+                }
+                | Cue::Video {
+                    fade_out,
+                    fade_type,
+                    ..
+                } => (*fade_out, *fade_type),
+                _ => (0.0, Default::default()),
+            });
+        self.stop_target(qid, StopMode::Immediate, fade_out, fade_type);
     }
 
     fn cue_is_active(&self, qid: Decimal) -> bool {
@@ -3379,5 +3412,33 @@ mod tests {
         engine.play_cue(stop_cue(99, Decimal::ONE, false, 0.0));
         assert!(engine.group_loops.is_empty());
         assert!(engine.snapshot().videos.is_empty());
+    }
+
+    #[test]
+    fn stop_cue_uses_the_cues_own_fade_out() {
+        let app = cuepool_gui::CuePoolApp::new();
+        let mut engine = ShowEngine::new(app.state().clone(), None);
+        let (cue, input) = active_audio(1, Decimal::ONE);
+        engine.active_cues.push(cue);
+        engine.state.lock_unpoisoned().show_file.cues = vec![Cue::Sound {
+            base: cuepool_core::CueBase {
+                qid: Decimal::ONE,
+                ..Default::default()
+            },
+            path: "tone.wav".into(),
+            start_time: Timespan::ZERO,
+            duration: Timespan::ZERO,
+            volume: 1.0,
+            pan: 0.0,
+            fade_in: 0.0,
+            fade_out: 2.0,
+            fade_type: Default::default(),
+            eq: None,
+            routing: Default::default(),
+        }];
+        assert!(engine.is_cue_active(Decimal::ONE));
+
+        engine.command(EngineCommand::StopCue(Decimal::ONE), Duration::ZERO);
+        assert!(input.is_fading(), "a cue with a fade-out fades, not cuts");
     }
 }

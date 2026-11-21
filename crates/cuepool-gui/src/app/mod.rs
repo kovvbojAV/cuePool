@@ -3282,6 +3282,7 @@ impl CuePoolApp {
                                     triggers.hotkey.is_some().then_some("hotkey"),
                                     triggers.midi.is_some().then_some("MIDI"),
                                     triggers.wall_clock.is_some().then_some("wall clock"),
+                                    triggers.time_window.is_some().then_some("time window"),
                                     triggers.timecode.is_some().then_some("timecode"),
                                 ]
                             })
